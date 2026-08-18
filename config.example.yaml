@@ -1,0 +1,45 @@
+input:
+  czi_path: D:/data/example.czi
+  output_dir: D:/data/cell_analysis_output
+  scene: 0
+  time_index: 0
+  z_projection: max
+  z_index: 0
+  zoom: 1.0
+  segmentation_channel: 0
+segmentation:
+  threshold_method: otsu
+  threshold_scale: 0.8
+  threshold_percentile: 90.0
+  adaptive_block_size_px: 51
+  adaptive_offset: 0.0
+  invert: false
+  opening_radius_px: 1
+  closing_radius_px: 2
+  fill_all_holes: true
+  min_hole_area_px: 32
+  min_area_px: 50
+  max_area_px: null
+  min_circularity: 0.05
+  min_local_contrast_ratio: 1.0
+  local_contrast_ring_px: 4
+  clear_border: true
+  border_exclusion_margin_px: 10
+  split_touching: false
+  min_peak_distance_px: 8
+  watershed_min_peak_height_px: 0.0
+  watershed_min_peak_prominence_px: 0.0
+  watershed_compactness: 0.0
+channels:
+  '0':
+    alias: DAPI
+    gaussian_sigma_px: 1.0
+    measurement_threshold:
+      method: otsu
+      percentile: 95.0
+output:
+  save_imagej_rois: true
+  save_geojson: true
+  save_label_image: true
+  preview_max_dimension_px: 2500
+  roi_simplify_tolerance_px: 1.0
