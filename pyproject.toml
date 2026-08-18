@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "czi-cell-analyzer"
+version = "0.1.0"
+description = "CZI cell segmentation, ImageJ ROI export, and per-channel fluorescence measurement"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+  "ipywidgets>=8.1",
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "openpyxl>=3.1",
+  "pandas>=2.1",
+  "Pillow>=10.0",
+  "pylibCZIrw>=6.1",
+  "PyYAML>=6.0",
+  "roifile>=2024.1",
+  "scikit-image>=0.22",
+  "scipy>=1.11",
+  "tifffile>=2024.1",
+]
+
+[project.scripts]
+cell-analyzer = "cell_analyzer.cli:main"
+cell-analyzer-gui = "cell_analyzer.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["cell_analyzer*"]

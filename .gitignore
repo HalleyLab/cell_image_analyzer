@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+output/
+validation_output/
+validation_config.yaml
+notebook_config.yaml
+*.egg-info/
+build/
+dist/
