@@ -188,6 +188,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "output": {
         **OUTPUT_SELECTION_DEFAULTS,
+        "table_columns": {},
         # Legacy aggregate keys remain readable by older sessions and notebooks.
         "save_masks": True,
         "save_processing_images": True,
@@ -535,6 +536,19 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     output["save_processing_images"] = any(
         output[key] for key in PROCESSING_IMAGE_OUTPUT_KEYS
     )
+    raw_table_columns = output.get("table_columns", {})
+    if not isinstance(raw_table_columns, dict):
+        raise ValueError("output.table_columns must be a mapping of table names to column lists.")
+    table_columns: dict[str, list[str]] = {}
+    for table_name, columns in raw_table_columns.items():
+        if not isinstance(columns, (list, tuple)):
+            raise ValueError(
+                f"output.table_columns.{table_name} must be a list of column names."
+            )
+        table_columns[str(table_name)] = list(
+            dict.fromkeys(str(column) for column in columns)
+        )
+    output["table_columns"] = table_columns
     output["ring_boundary_width_px"] = max(
         1, int(output.get("ring_boundary_width_px", 1))
     )

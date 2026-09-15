@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 from skimage.draw import disk
 
 from brain_section_analyzer.analysis import (
@@ -14,6 +15,7 @@ from brain_section_analyzer.analysis import (
     _overlay,
     _clean_and_label_plaques,
     _plaque_ring_metrics_table,
+    _select_output_columns,
     _write_outputs,
     analyze_arrays,
 )
@@ -403,6 +405,14 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         self.assertIn("ring_cd68_in_iba1_fraction_of_iba1", ring_table)
 
 
+    def test_selected_output_columns_are_exact_and_ordered(self) -> None:
+        frame = pd.DataFrame({"first": [1], "second": [2], "third": [3]})
+        config = {"output": {"table_columns": {"example": ["third", "first"]}}}
+
+        selected = _select_output_columns(frame, config, "example")
+
+        self.assertEqual(list(selected.columns), ["third", "first"])
+
     def test_output_selection_writes_only_requested_result(self) -> None:
         shape = (40, 40)
         images = {
@@ -416,6 +426,9 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         for key in OUTPUT_SELECTION_DEFAULTS:
             config["output"][key] = False
         config["output"]["save_primary_objects_csv"] = True
+        config["output"]["table_columns"] = {
+            "primary_objects": ["primary_object_id", "primary_object_area_um2"]
+        }
         products = analyze_arrays(
             images,
             config,
@@ -428,6 +441,9 @@ class BrainSectionAnalysisTests(unittest.TestCase):
                 Path(directory), config, info, products, images
             )
             written = {path.name for path in Path(directory).iterdir()}
+            saved_columns = list(
+                pd.read_csv(paths["plaque_measurements_csv"]).columns
+            )
 
         self.assertEqual(
             written,
@@ -441,6 +457,10 @@ class BrainSectionAnalysisTests(unittest.TestCase):
             set(paths), {"plaque_measurements_csv", "config_used", "metadata"}
         )
         self.assertEqual(len(tables["primary_objects"]), 1)
+        self.assertEqual(
+            saved_columns,
+            ["primary_object_id", "primary_object_area_um2"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

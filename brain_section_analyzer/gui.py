@@ -36,6 +36,36 @@ from .config import (
 ROLES = ("abeta", "iba1", "cd68", "dapi")
 ROLE_LABELS = dict(zip(ROLES, ("Channel 1", "Channel 2", "Channel 3", "Channel 4")))
 THRESHOLD_METHODS = ("manual", "otsu", "yen", "triangle", "percentile")
+TABLE_FILE_OUTPUT_KEYS = {
+    "save_excel",
+    "save_image_summary_csv",
+    "save_primary_objects_csv",
+    "save_candidate_qc_csv",
+    "save_channel_objects_csv",
+    "save_cells_csv",
+    "save_ring_metrics_csv",
+    "save_animal_summary_csv",
+}
+OUTPUT_TABLE_LABELS = {
+    "batch_summary": "Batch Summary",
+    "image_summary": "Image Summary",
+    "primary_objects": "Primary Objects",
+    "candidate_qc": "Channel 1 Candidate QC",
+    "channel_objects": "Channel Objects",
+    "cells": "Cells",
+    "ring_metrics": "Primary-object Ring Metrics",
+    "animal_summary": "Animal Summary",
+    "thresholds": "Thresholds (per-image Excel)",
+}
+BATCH_SUMMARY_COLUMNS = (
+    "batch_file_index",
+    "source_file",
+    "source_name",
+    "status",
+    "primary_object_count_all",
+    "output_dir",
+    "error",
+)
 
 
 def _optional_float(variable: tk.StringVar) -> float | None:
@@ -59,6 +89,8 @@ class BrainSectionGui:
         self.marker_vars: dict[str, dict[str, tk.Variable]] = {}
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_path: Path | None = None
+        self.available_output_columns: dict[str, list[str]] = {}
+        self.selected_output_columns: dict[str, list[str]] = {}
         self._build()
         self._apply_config(copy.deepcopy(DEFAULT_CONFIG))
         self.root.after(100, self._poll_messages)
@@ -428,22 +460,28 @@ class BrainSectionGui:
             }
         )
 
-        table_frame = ttk.LabelFrame(parent, text="Tables", padding=8)
+        table_frame = ttk.LabelFrame(parent, text="Table columns", padding=8)
         table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        table_outputs = (
-            ("Excel workbook", "save_excel"),
-            ("Image summary CSV", "save_image_summary_csv"),
-            ("Primary-object measurements CSV", "save_primary_objects_csv"),
-            ("Channel 1 candidate QC CSV", "save_candidate_qc_csv"),
-            ("Channel-object QC CSV", "save_channel_objects_csv"),
-            ("Cell measurements CSV", "save_cells_csv"),
-            ("Primary-object ring metrics CSV", "save_ring_metrics_csv"),
-            ("Animal summary CSV", "save_animal_summary_csv"),
+        ttk.Label(
+            table_frame,
+            text="Run a preview to load the exact parameters produced by the current settings.",
+            wraplength=250,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.choose_columns_button = ttk.Button(
+            table_frame,
+            text="Choose output parameters...",
+            command=self._choose_output_columns,
+            state="disabled",
         )
-        for row, (label, key) in enumerate(table_outputs):
-            ttk.Checkbutton(table_frame, text=label, variable=self.output_vars[key]).grid(
-                row=row, column=0, sticky="w", pady=2
-            )
+        self.choose_columns_button.grid(row=1, column=0, sticky="w")
+        self.output_column_status = tk.StringVar(
+            value="All table parameters will be exported until a preview is run."
+        )
+        ttk.Label(
+            table_frame,
+            textvariable=self.output_column_status,
+            wraplength=250,
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
         image_frame = ttk.LabelFrame(parent, text="Images and masks", padding=8)
         image_frame.grid(row=0, column=1, sticky="nsew", padx=5)
@@ -518,6 +556,153 @@ class BrainSectionGui:
 
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(2, weight=1)
+
+    def _update_output_column_status(self) -> None:
+        if not self.available_output_columns:
+            self.output_column_status.set(
+                "All table parameters will be exported until a preview is run."
+            )
+            return
+        total = sum(len(columns) for columns in self.available_output_columns.values())
+        selected = sum(
+            len(self.selected_output_columns.get(name, columns))
+            for name, columns in self.available_output_columns.items()
+        )
+        self.output_column_status.set(
+            f"{selected} of {total} parameters selected across "
+            f"{len(self.available_output_columns)} tables."
+        )
+
+    def _set_available_output_columns(self, tables: dict[str, Any]) -> None:
+        available = {
+            name: [str(column) for column in table.columns]
+            for name, table in tables.items()
+            if name in OUTPUT_TABLE_LABELS and hasattr(table, "columns")
+        }
+        available["batch_summary"] = list(BATCH_SUMMARY_COLUMNS)
+        image_columns = available.get("image_summary", [])
+        animal_columns = [
+            "genotype",
+            "mouse_id",
+            "region",
+            "sex",
+            "image_count",
+            "roi_area_um2",
+            "roi_area_mm2",
+            "primary_object_count_all",
+            "primary_object_count_boundary",
+            "primary_object_count_interior",
+            "primary_object_density_all_per_mm2",
+        ]
+        animal_columns.extend(
+            column
+            for column in image_columns
+            if column.endswith("_area_um2")
+            or "fraction" in column
+            or column.endswith("_per_mm2")
+        )
+        animal_columns.extend(
+            (
+                "median_interior_primary_object_area_um2",
+                "mean_interior_primary_object_area_um2",
+            )
+        )
+        available["animal_summary"] = list(dict.fromkeys(animal_columns))
+        self.available_output_columns = {
+            name: available[name]
+            for name in OUTPUT_TABLE_LABELS
+            if name in available
+        }
+        self.choose_columns_button.configure(state="normal")
+        self._update_output_column_status()
+
+    def _choose_output_columns(self) -> None:
+        if not self.available_output_columns:
+            messagebox.showinfo(
+                "Output parameters",
+                "Run Preview selected image first to load the available parameters.",
+            )
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Choose output parameters")
+        window.geometry("840x560")
+        window.transient(self.root)
+        window.grab_set()
+        body = ttk.Frame(window, padding=10)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Table").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text="Parameters to include").grid(row=0, column=1, sticky="w")
+        table_list = tk.Listbox(body, exportselection=False, width=30)
+        table_list.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        column_list = tk.Listbox(body, selectmode="extended", exportselection=False)
+        column_list.grid(row=1, column=1, sticky="nsew")
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=column_list.yview)
+        scrollbar.grid(row=1, column=2, sticky="ns")
+        column_list.configure(yscrollcommand=scrollbar.set)
+        table_names = list(self.available_output_columns)
+        for name in table_names:
+            table_list.insert(tk.END, OUTPUT_TABLE_LABELS[name])
+        draft = {
+            name: list(self.selected_output_columns.get(name, columns))
+            for name, columns in self.available_output_columns.items()
+        }
+        current: dict[str, str | None] = {"name": None}
+
+        def store_current() -> None:
+            name = current["name"]
+            if name is not None:
+                draft[name] = [column_list.get(index) for index in column_list.curselection()]
+
+        def show_table(_event: Any = None) -> None:
+            store_current()
+            selection = table_list.curselection()
+            if not selection:
+                return
+            name = table_names[selection[0]]
+            current["name"] = name
+            column_list.delete(0, tk.END)
+            selected = set(draft[name])
+            for index, column in enumerate(self.available_output_columns[name]):
+                column_list.insert(tk.END, column)
+                if column in selected:
+                    column_list.selection_set(index)
+
+        def select_all() -> None:
+            column_list.selection_set(0, tk.END)
+
+        def clear_current() -> None:
+            column_list.selection_clear(0, tk.END)
+
+        def apply_selection() -> None:
+            store_current()
+            empty = [OUTPUT_TABLE_LABELS[name] for name in table_names if not draft[name]]
+            if empty:
+                messagebox.showerror(
+                    "Output parameters",
+                    "Select at least one parameter for: " + ", ".join(empty),
+                    parent=window,
+                )
+                return
+            self.selected_output_columns = {
+                name: columns
+                for name, columns in draft.items()
+                if columns != self.available_output_columns[name]
+            }
+            self._update_output_column_status()
+            window.destroy()
+
+        table_list.bind("<<ListboxSelect>>", show_table)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Button(buttons, text="Select all in current table", command=select_all).pack(side="left")
+        ttk.Button(buttons, text="Clear current table", command=clear_current).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Apply", command=apply_selection).pack(side="right")
+        ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side="right", padx=6)
+        body.rowconfigure(1, weight=1)
+        body.columnconfigure(1, weight=1)
+        table_list.selection_set(0)
+        show_table()
 
     def _selected_path(self) -> Path:
         if not self.image_paths:
@@ -768,9 +953,14 @@ class BrainSectionGui:
         config["output"].update(
             {
                 **{
-                    key: bool(self.output_vars[key].get())
+                    key: (
+                        True
+                        if key in TABLE_FILE_OUTPUT_KEYS
+                        else bool(self.output_vars[key].get())
+                    )
                     for key in OUTPUT_SELECTION_DEFAULTS
                 },
+                "table_columns": copy.deepcopy(self.selected_output_columns),
                 "ring_boundary_width_px": int(
                     self.output_vars["ring_boundary_width_px"].get()
                 ),
@@ -839,6 +1029,8 @@ class BrainSectionGui:
             self.output_vars[key].set(output.get(key, default))
         for key in ("ring_boundary_width_px", "preview_max_dimension_px"):
             self.output_vars[key].set(output.get(key, DEFAULT_CONFIG["output"][key]))
+        self.selected_output_columns = copy.deepcopy(output.get("table_columns", {}))
+        self._update_output_column_status()
         self.output_vars["continue_on_error"].set(bool(config.get("batch", {}).get("continue_on_error", True)))
         self.metadata_csv.set(str(config.get("batch", {}).get("metadata_csv") or ""))
 
@@ -937,7 +1129,9 @@ class BrainSectionGui:
         def worker() -> None:
             try:
                 result = run_analysis(
-                    config, progress=lambda message: self.messages.put(("progress", message))
+                    config,
+                    progress=lambda message: self.messages.put(("progress", message)),
+                    include_tables=True,
                 )
                 self.messages.put(("preview_complete", result))
             except Exception as error:
@@ -1002,6 +1196,7 @@ class BrainSectionGui:
                 elif kind == "preview_complete":
                     self._set_busy(False)
                     self.status.set("Preview complete")
+                    self._set_available_output_columns(value.pop("_tables", {}))
                     qc_path = value.get("files", {}).get("qc")
                     if qc_path and Path(qc_path).is_file():
                         try:

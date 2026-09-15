@@ -13,7 +13,7 @@ import pandas as pd
 
 from cell_analyzer.image_io import SUPPORTED_IMAGE_SUFFIXES
 
-from .analysis import _export_table, run_analysis
+from .analysis import _export_table, _select_output_columns, run_analysis
 from .config import load_config, save_config
 
 
@@ -372,14 +372,31 @@ def run_batch_analysis(
     ring_path = root / "combined_primary_object_ring_metrics.csv"
     animal_path = root / "animal_summary.csv"
     excel_path = root / "cell_analysis_batch_results.xlsx"
-    public_images = _export_table(combined_images, template)
-    public_objects = _export_table(combined_plaques, template)
-    public_candidates = _export_table(combined_candidates, template)
-    public_channels = _export_table(combined_markers, template)
-    public_cells = _export_table(combined_microglia, template)
-    public_rings = _export_table(combined_rings, template)
-    public_animals = _export_table(animals, template)
-    batch_summary.to_csv(batch_summary_path, index=False)
+    public_images = _select_output_columns(
+        _export_table(combined_images, template), template, "image_summary"
+    )
+    public_objects = _select_output_columns(
+        _export_table(combined_plaques, template), template, "primary_objects"
+    )
+    public_candidates = _select_output_columns(
+        _export_table(combined_candidates, template), template, "candidate_qc"
+    )
+    public_channels = _select_output_columns(
+        _export_table(combined_markers, template), template, "channel_objects"
+    )
+    public_cells = _select_output_columns(
+        _export_table(combined_microglia, template), template, "cells"
+    )
+    public_rings = _select_output_columns(
+        _export_table(combined_rings, template), template, "ring_metrics"
+    )
+    public_animals = _select_output_columns(
+        _export_table(animals, template), template, "animal_summary"
+    )
+    public_batch_summary = _select_output_columns(
+        batch_summary, template, "batch_summary"
+    )
+    public_batch_summary.to_csv(batch_summary_path, index=False)
     output = template.get("output", {})
     result_files = {
         "selected_image_files": str(selected_path),
@@ -401,7 +418,7 @@ def run_batch_analysis(
             result_files[key] = str(path)
     if bool(output.get("save_excel", True)):
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            batch_summary.to_excel(writer, sheet_name="Batch Summary", index=False)
+            public_batch_summary.to_excel(writer, sheet_name="Batch Summary", index=False)
             public_images.to_excel(writer, sheet_name="Image Summary", index=False)
             public_objects.to_excel(writer, sheet_name="Primary Objects", index=False)
             public_candidates.to_excel(writer, sheet_name="Channel 1 QC", index=False)

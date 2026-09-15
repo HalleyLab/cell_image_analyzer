@@ -78,6 +78,18 @@ def _export_table(
     return result
 
 
+def _select_output_columns(
+    frame: pd.DataFrame, config: dict[str, Any], table_name: str
+) -> pd.DataFrame:
+    """Keep the exact user-selected columns; a missing selection means all columns."""
+
+    selections = config.get("output", {}).get("table_columns", {})
+    if table_name not in selections:
+        return frame
+    columns = [column for column in selections[table_name] if column in frame.columns]
+    return frame.loc[:, columns]
+
+
 @dataclass
 class AnalysisProducts:
     """Tables, masks, and thresholds produced from one image."""
@@ -1679,6 +1691,15 @@ def _write_outputs(
     channel_table = _export_table(products.marker_component_qc, config)
     cell_table = _export_table(products.microglia_cells, config)
     public_ring_table = _export_table(ring_table, config)
+    threshold_table = pd.DataFrame(
+        [
+            {
+                "channel": config["channels"][role]["alias"],
+                "threshold_raw": value,
+            }
+            for role, value in products.thresholds.items()
+        ]
+    )
     tables = {
         "image_summary": image_table,
         "primary_objects": object_table,
@@ -1686,15 +1707,20 @@ def _write_outputs(
         "channel_objects": channel_table,
         "cells": cell_table,
         "ring_metrics": public_ring_table,
+        "thresholds": threshold_table,
+    }
+    selected_tables = {
+        name: _select_output_columns(table, config, name)
+        for name, table in tables.items()
     }
     paths: dict[str, str] = {}
     table_outputs = (
-        ("save_image_summary_csv", "image_summary_csv", image_csv, image_table),
-        ("save_primary_objects_csv", "plaque_measurements_csv", plaque_csv, object_table),
-        ("save_candidate_qc_csv", "abeta_candidate_qc_csv", candidate_csv, candidate_table),
-        ("save_channel_objects_csv", "marker_component_qc_csv", marker_csv, channel_table),
-        ("save_cells_csv", "microglia_cells_csv", microglia_csv, cell_table),
-        ("save_ring_metrics_csv", "plaque_ring_metrics_csv", ring_csv, public_ring_table),
+        ("save_image_summary_csv", "image_summary_csv", image_csv, selected_tables["image_summary"]),
+        ("save_primary_objects_csv", "plaque_measurements_csv", plaque_csv, selected_tables["primary_objects"]),
+        ("save_candidate_qc_csv", "abeta_candidate_qc_csv", candidate_csv, selected_tables["candidate_qc"]),
+        ("save_channel_objects_csv", "marker_component_qc_csv", marker_csv, selected_tables["channel_objects"]),
+        ("save_cells_csv", "microglia_cells_csv", microglia_csv, selected_tables["cells"]),
+        ("save_ring_metrics_csv", "plaque_ring_metrics_csv", ring_csv, selected_tables["ring_metrics"]),
     )
     for flag, key, table_path, table in table_outputs:
         if bool(config["output"].get(flag, True)):
@@ -1702,21 +1728,13 @@ def _write_outputs(
             paths[key] = str(table_path)
     if bool(config["output"].get("save_excel", True)):
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            image_table.to_excel(writer, sheet_name="Image Summary", index=False)
-            object_table.to_excel(writer, sheet_name="Primary Objects", index=False)
-            candidate_table.to_excel(writer, sheet_name="Channel 1 QC", index=False)
-            channel_table.to_excel(writer, sheet_name="Channel Objects", index=False)
-            cell_table.to_excel(writer, sheet_name="Cells", index=False)
-            public_ring_table.to_excel(writer, sheet_name="Object Ring Metrics", index=False)
-            pd.DataFrame(
-                [
-                    {
-                        "channel": config["channels"][role]["alias"],
-                        "threshold_raw": value,
-                    }
-                    for role, value in products.thresholds.items()
-                ]
-            ).to_excel(writer, sheet_name="Thresholds", index=False)
+            selected_tables["image_summary"].to_excel(writer, sheet_name="Image Summary", index=False)
+            selected_tables["primary_objects"].to_excel(writer, sheet_name="Primary Objects", index=False)
+            selected_tables["candidate_qc"].to_excel(writer, sheet_name="Channel 1 QC", index=False)
+            selected_tables["channel_objects"].to_excel(writer, sheet_name="Channel Objects", index=False)
+            selected_tables["cells"].to_excel(writer, sheet_name="Cells", index=False)
+            selected_tables["ring_metrics"].to_excel(writer, sheet_name="Object Ring Metrics", index=False)
+            selected_tables["thresholds"].to_excel(writer, sheet_name="Thresholds", index=False)
         paths["excel"] = str(excel_path)
 
     config_path = output_dir / "config_used.yaml"

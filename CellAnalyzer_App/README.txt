@@ -5,8 +5,8 @@ Cell Analyzer
 3. Add CZI, LIF, OIR, VSI, ND2, OME-TIFF, or other supported microscopy images. Images may come from multiple folders.
 4. Inspect one image, then assign image channels to Channel 1-4. Set each channel's name, wavelength, and display color.
 5. Adjust the parameters, open the Outputs tab, and select "Preview selected image". The processed preview is shown in the same tab. Use an analysis zoom of 1.0 for final measurements.
-6. In the Outputs tab, select the exact tables, masks, and processing images to save, then select "Run all images". The current settings apply to every selected file.
-7. "Save full session" stores the image paths, output folder, cache folder, and all parameters for later reuse.
+6. After preview, select "Choose output parameters..." to choose the exact columns included in each CSV and Excel sheet. Select the images and masks to save, then select "Run all images". The current settings apply to every selected file.
+7. "Save full session" stores the image paths, output folder, cache folder, parameters, and selected table columns for later reuse.
 
 No cache is intentionally written to the system drive. The application checks the cache selection only when preview or analysis starts.
 
