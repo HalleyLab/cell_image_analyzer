@@ -13,6 +13,7 @@ from skimage.draw import disk
 from brain_section_analyzer.analysis import (
     _channel_colors,
     _overlay,
+    _selected_qc_panels,
     _clean_and_label_plaques,
     _plaque_ring_metrics_table,
     _select_output_columns,
@@ -441,6 +442,16 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         self.assertEqual(int(products.image_summary.iloc[0]["microglia_count_roi"]), 2)
         self.assertEqual(set(products.microglia_cells["nucleus_channel"]), {"cd68"})
         self.assertTrue(products.microglia_cells["confirmation_channel"].eq("").all())
+
+    def test_overview_qc_panel_selection_is_exact(self) -> None:
+        panels = [
+            ("composite", "Composite", np.zeros((1, 1))),
+            ("objects", "Objects", np.ones((1, 1))),
+        ]
+
+        selected = _selected_qc_panels(panels, ["objects"])
+
+        self.assertEqual([panel[0] for panel in selected], ["objects"])
 
     def test_preview_choices_include_only_generated_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

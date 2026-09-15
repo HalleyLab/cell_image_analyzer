@@ -1466,6 +1466,13 @@ def _overlay(
     return result
 
 
+def _selected_qc_panels(
+    panels: list[tuple[str, str, np.ndarray]], selected: list[str]
+) -> list[tuple[str, str, np.ndarray]]:
+    selected_names = set(selected)
+    return [panel for panel in panels if panel[0] in selected_names]
+
+
 def _save_qc(
     path: Path | None,
     raw_images: dict[str, np.ndarray],
@@ -1474,6 +1481,7 @@ def _save_qc(
     channel_colors: dict[str, tuple[float, float, float]],
     channel_names: dict[str, str],
     cell_count_config: dict[str, Any],
+    selected_qc_panels: list[str],
     processing_dir: Path | None = None,
     save_raw_channels: bool = True,
     save_composite: bool = True,
@@ -1571,10 +1579,16 @@ def _save_qc(
             ("10_primary_object_distance_rings", "Primary-object distance-ring boundaries yellow", ring_overlay)
         )
     panels.append(("11_tissue_roi", "Tissue ROI boundary magenta", tissue_overlay))
+    processing_panels = panels
+    panels = _selected_qc_panels(panels, selected_qc_panels)
 
     saved: dict[str, str] = {}
     if path is not None:
-        columns = 4
+        if not panels:
+            raise ValueError(
+                "None of the selected Overview QC panels are available for this image."
+            )
+        columns = min(4, len(panels))
         rows = int(math.ceil(len(panels) / columns))
         figure, axes = plt.subplots(rows, columns, figsize=(18, 4.5 * rows), squeeze=False)
         for axis, (_, title, panel) in zip(axes.ravel(), panels):
@@ -1597,7 +1611,7 @@ def _save_qc(
                 filename = processing_dir / f"{index:02d}_raw_channel_{index}.png"
                 plt.imsave(filename, tinted[role])
                 saved[f"processing_raw_{role}"] = str(filename)
-        for name, _, panel in panels:
+        for name, _, panel in processing_panels:
             if name == "05_composite" and not save_composite:
                 continue
             if name != "05_composite" and not save_segmentation:
@@ -1863,6 +1877,7 @@ def _write_outputs(
                 channel_colors,
                 channel_names,
                 config["microglia_count"],
+                list(output.get("qc_panels", [])),
                 output_dir / "processing_images" if save_processing else None,
                 **processing_flags,
                 ring_boundary_width_px=int(output.get("ring_boundary_width_px", 1)),

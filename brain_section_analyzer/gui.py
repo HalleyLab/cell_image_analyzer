@@ -28,6 +28,7 @@ from .batch import _resolve_mask, run_batch_analysis
 from .config import (
     DEFAULT_CONFIG,
     OUTPUT_SELECTION_DEFAULTS,
+    QC_PANEL_DEFAULTS,
     load_config,
     normalize_config,
     save_config,
@@ -46,6 +47,17 @@ PREVIEW_IMAGE_OUTPUT_KEYS = (
     "save_segmentation_images",
     "save_mask_images",
 )
+QC_PANEL_LABELS = {
+    "05_composite": "Composite",
+    "06_primary_object_segmentation": "Primary-object segmentation",
+    "07_channel_1_objects": "Channel 1 object filter",
+    "07_channel_2_objects": "Channel 2 object filter",
+    "07_channel_3_objects": "Channel 3 object filter",
+    "07_channel_4_objects": "Channel 4 object filter",
+    "09_cell_counting": "Cell counting",
+    "10_primary_object_distance_rings": "Distance rings",
+    "11_tissue_roi": "Tissue ROI",
+}
 TABLE_FILE_OUTPUT_KEYS = {
     "save_excel",
     "save_image_summary_csv",
@@ -101,7 +113,7 @@ class BrainSectionGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Cell Analyzer")
-        self.root.geometry("1380x930")
+        self.root.geometry("1380x980")
         self.image_paths: list[Path] = []
         self.info = None
         self.messages: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -200,16 +212,16 @@ class BrainSectionGui:
         self._build_microglia_tab(microglia_tab)
         self._build_output_tab(output_tab)
 
-        controls = ttk.Frame(outer)
+        controls = ttk.Frame(outer, padding=(0, 6))
         controls.pack(fill="x", pady=(8, 0))
         ttk.Button(
-            controls, text="Load parameters/session", width=25, command=self._load_session
+            controls, text="Load parameters", padding=(12, 7), command=self._load_session
         ).pack(side="left", padx=3)
         ttk.Button(
-            controls, text="Save parameters", width=20, command=self._save_parameters
+            controls, text="Save parameters", padding=(12, 7), command=self._save_parameters
         ).pack(side="left", padx=3)
         ttk.Button(
-            controls, text="Save session", width=18, command=self._save_session
+            controls, text="Save session", padding=(12, 7), command=self._save_session
         ).pack(side="left", padx=3)
         self.status = tk.StringVar(value="Ready")
         ttk.Label(controls, textvariable=self.status).pack(side="left", padx=12)
@@ -328,8 +340,24 @@ class BrainSectionGui:
             ttk.Entry(parent, textvariable=variables["percentile"], width=8).grid(row=row, column=10, padx=3)
 
         ttk.Label(parent, text="These channel settings are applied to every selected file.").grid(row=5, column=0, columnspan=11, sticky="w", padx=4, pady=(4, 0))
-        filter_tabs = ttk.Notebook(parent)
-        filter_tabs.grid(row=6, column=0, columnspan=11, sticky="nsew", padx=5, pady=12)
+        filter_group = ttk.LabelFrame(parent, text="Object filter", padding=8)
+        filter_group.grid(row=6, column=0, columnspan=11, sticky="nsew", padx=5, pady=12)
+        selector = ttk.Frame(filter_group)
+        selector.grid(row=0, column=0, sticky="w")
+        ttk.Label(selector, text="Channel").pack(side="left")
+        self.object_filter_channel = tk.StringVar(value=ROLE_LABELS[ROLES[0]])
+        object_filter_selector = ttk.Combobox(
+            selector,
+            textvariable=self.object_filter_channel,
+            values=tuple(ROLE_LABELS.values()),
+            state="readonly",
+            width=16,
+        )
+        object_filter_selector.pack(side="left", padx=6)
+        object_filter_selector.bind("<<ComboboxSelected>>", self._show_object_filter_channel)
+        container = ttk.Frame(filter_group)
+        container.grid(row=1, column=0, sticky="nsew")
+        self.object_filter_frames: dict[str, ttk.Frame] = {}
         for role in ROLES:
             defaults = DEFAULT_CONFIG["channels"][role]["object_filter"]
             variables = {
@@ -345,8 +373,9 @@ class BrainSectionGui:
                 "max_eccentricity": tk.StringVar(value=str(defaults["max_eccentricity"])),
             }
             self.marker_vars[role] = variables
-            frame = ttk.Frame(filter_tabs, padding=8)
-            filter_tabs.add(frame, text=f"{ROLE_LABELS[role]} object filter")
+            frame = ttk.Frame(container, padding=(0, 6))
+            frame.grid(row=0, column=0, sticky="nsew")
+            self.object_filter_frames[role] = frame
             self._entry_grid(
                 frame,
                 variables,
@@ -363,6 +392,11 @@ class BrainSectionGui:
                     ("Maximum eccentricity", "max_eccentricity", None),
                 ],
             )
+        self._show_object_filter_channel()
+
+    def _show_object_filter_channel(self, _event: Any = None) -> None:
+        role = ROLE_BY_LABEL[self.object_filter_channel.get()]
+        self.object_filter_frames[role].tkraise()
 
     def _build_plaque_tab(self, parent: ttk.Frame) -> None:
         self.plaque_vars = {
@@ -434,6 +468,14 @@ class BrainSectionGui:
             frame.grid(row=0, column=column, sticky="nsew", padx=5)
             self._entry_grid(frame, self.plaque_vars, fields)
             parent.columnconfigure(column, weight=1)
+        ttk.Label(
+            parent,
+            text=(
+                "Primary objects are the final Channel 1 objects used for per-object "
+                "measurements, distance rings, and nearby-cell counts."
+            ),
+            wraplength=1200,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(10, 0))
 
     def _build_microglia_tab(self, parent: ttk.Frame) -> None:
         self.microglia_vars = {
@@ -495,6 +537,9 @@ class BrainSectionGui:
                 "open_output": tk.BooleanVar(value=True),
             }
         )
+        self.qc_panel_vars = {
+            key: tk.BooleanVar(value=True) for key in QC_PANEL_DEFAULTS
+        }
 
         table_frame = ttk.LabelFrame(parent, text="Table columns", padding=8)
         table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
@@ -543,6 +588,21 @@ class BrainSectionGui:
             text="The first five choices also control which preview images are generated.",
             wraplength=230,
         ).grid(row=len(image_outputs), column=0, sticky="w", pady=(8, 0))
+        qc_menu_button = ttk.Menubutton(image_frame, text="Overview QC panels...")
+        qc_menu = tk.Menu(qc_menu_button, tearoff=False)
+        for key, label in QC_PANEL_LABELS.items():
+            qc_menu.add_checkbutton(
+                label=label,
+                variable=self.qc_panel_vars[key],
+                command=self._update_qc_panel_status,
+            )
+        qc_menu_button.configure(menu=qc_menu)
+        qc_menu_button.grid(row=len(image_outputs) + 1, column=0, sticky="w", pady=(8, 0))
+        self.qc_panel_status = tk.StringVar()
+        ttk.Label(image_frame, textvariable=self.qc_panel_status).grid(
+            row=len(image_outputs) + 2, column=0, sticky="w", pady=(4, 0)
+        )
+        self._update_qc_panel_status()
 
         preview_frame = ttk.LabelFrame(parent, text="Processed preview", padding=8)
         preview_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
@@ -611,6 +671,10 @@ class BrainSectionGui:
 
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(2, weight=1)
+
+    def _update_qc_panel_status(self) -> None:
+        selected = sum(variable.get() for variable in self.qc_panel_vars.values())
+        self.qc_panel_status.set(f"{selected} of {len(self.qc_panel_vars)} panels selected")
 
     def _update_output_column_status(self) -> None:
         if not self.available_output_columns:
@@ -1030,6 +1094,9 @@ class BrainSectionGui:
                     for key in OUTPUT_SELECTION_DEFAULTS
                 },
                 "table_columns": copy.deepcopy(self.selected_output_columns),
+                "qc_panels": [
+                    key for key, variable in self.qc_panel_vars.items() if variable.get()
+                ],
                 "ring_boundary_width_px": int(
                     self.output_vars["ring_boundary_width_px"].get()
                 ),
@@ -1101,6 +1168,10 @@ class BrainSectionGui:
             self.output_vars[key].set(output.get(key, default))
         for key in ("ring_boundary_width_px", "preview_max_dimension_px"):
             self.output_vars[key].set(output.get(key, DEFAULT_CONFIG["output"][key]))
+        selected_qc_panels = set(output.get("qc_panels", QC_PANEL_DEFAULTS))
+        for key, variable in self.qc_panel_vars.items():
+            variable.set(key in selected_qc_panels)
+        self._update_qc_panel_status()
         self.selected_output_columns = copy.deepcopy(output.get("table_columns", {}))
         self._update_output_column_status()
         self.output_vars["continue_on_error"].set(bool(config.get("batch", {}).get("continue_on_error", True)))

@@ -15,6 +15,17 @@ from cell_analyzer.models import CziInfo
 
 
 THRESHOLD_METHODS = {"manual", "otsu", "yen", "triangle", "percentile"}
+QC_PANEL_DEFAULTS = (
+    "05_composite",
+    "06_primary_object_segmentation",
+    "07_channel_1_objects",
+    "07_channel_2_objects",
+    "07_channel_3_objects",
+    "07_channel_4_objects",
+    "09_cell_counting",
+    "10_primary_object_distance_rings",
+    "11_tissue_roi",
+)
 
 
 DEFAULT_THRESHOLD: dict[str, Any] = {
@@ -193,6 +204,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output": {
         **OUTPUT_SELECTION_DEFAULTS,
         "table_columns": {},
+        "qc_panels": list(QC_PANEL_DEFAULTS),
         # Legacy aggregate keys remain readable by older sessions and notebooks.
         "save_masks": True,
         "save_processing_images": True,
@@ -540,6 +552,15 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     output["save_processing_images"] = any(
         output[key] for key in PROCESSING_IMAGE_OUTPUT_KEYS
     )
+    qc_panels = output.get("qc_panels", QC_PANEL_DEFAULTS)
+    if not isinstance(qc_panels, (list, tuple)):
+        raise ValueError("output.qc_panels must be a list.")
+    unknown_qc_panels = set(qc_panels) - set(QC_PANEL_DEFAULTS)
+    if unknown_qc_panels:
+        raise ValueError(f"Unknown output.qc_panels: {sorted(unknown_qc_panels)}")
+    output["qc_panels"] = list(dict.fromkeys(qc_panels))
+    if output["save_qc"] and not output["qc_panels"]:
+        raise ValueError("Select at least one Overview QC panel or disable Overview QC.")
     raw_table_columns = output.get("table_columns", {})
     if not isinstance(raw_table_columns, dict):
         raise ValueError("output.table_columns must be a mapping of table names to column lists.")
