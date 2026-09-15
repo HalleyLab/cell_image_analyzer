@@ -1,0 +1,137 @@
+input:
+  image_path: I:/QIULAB/data/example.czi
+  output_dir: I:/QIULAB/data/cell_analysis_result
+  scene: 0
+  time_index: 0
+  z_projection: max
+  z_index: 0
+  zoom: 1.0
+  pixel_size_um_x: null
+  pixel_size_um_y: null
+  image_width_um: null
+  image_height_um: null
+
+channels:
+  abeta:
+    index: 0
+    alias: Abeta
+    gaussian_sigma_px: 1.0
+    threshold: {method: manual, value: 10000, scale: 1.0, percentile: 95.0}
+  iba1:
+    index: 1
+    alias: Iba1
+    gaussian_sigma_px: 1.0
+    threshold: {method: manual, value: 5000, scale: 1.0, percentile: 95.0}
+    # Connected components are filtered only after the intensity threshold.
+    object_filter:
+      enabled: true
+      opening_radius_px: 0
+      closing_radius_px: 0
+      fill_holes: false
+      max_hole_area_um2: 0.0
+      min_area_um2: 0.0
+      max_area_um2: null
+      min_circularity: 0.0
+      min_solidity: 0.0
+      max_eccentricity: 1.0
+  cd68:
+    index: 2
+    alias: CD68
+    gaussian_sigma_px: 1.0
+    threshold: {method: manual, value: 5000, scale: 1.0, percentile: 95.0}
+    object_filter:
+      enabled: true
+      opening_radius_px: 0
+      closing_radius_px: 0
+      fill_holes: false
+      max_hole_area_um2: 0.0
+      min_area_um2: 0.0
+      max_area_um2: null
+      min_circularity: 0.0
+      min_solidity: 0.0
+      max_eccentricity: 1.0
+  dapi:
+    enabled: true
+    index: 3
+    alias: DAPI
+    gaussian_sigma_px: 1.0
+    threshold: {method: otsu, value: 0, scale: 1.0, percentile: 95.0}
+
+tissue_roi:
+  # full_image requires an image already cropped to one anatomical region.
+  # mask_directory expects one mask named <CZI stem>_mask.png per image.
+  mode: full_image
+  mask_path: null
+  mask_directory: null
+  mask_suffix: _mask.png
+  invert_mask: false
+
+plaque:
+  opening_radius_px: 0
+  closing_radius_px: 1
+  fill_holes: false
+  max_hole_area_um2: 0.0
+  min_area_um2: 10.0
+  max_area_um2: null
+  min_circularity: 0.0
+  min_solidity: 0.0
+  max_eccentricity: 1.0
+  # Detect soma-like Aβ outlines at a lower Aβ threshold, then exclude them
+  # using physical diameter, filled outer shape, and a dark nucleus/hole.
+  # CD68 and Iba1 are never used to decide whether an object is a plaque.
+  neuron_exclusion_mode: shape_and_dark_center
+  neuron_detection_threshold_scale: 0.75
+  neuron_min_diameter_um: 8.0
+  neuron_max_diameter_um: 28.0
+  neuron_min_circularity: 0.35
+  neuron_min_solidity: 0.60
+  neuron_min_hole_fraction: 0.03
+  neuron_max_center_shell_ratio: 0.95
+  # Optionally keep only plaques with enough DAPI+/Iba1+ microglia within
+  # this distance from the plaque edge.
+  require_nearby_microglia: true
+  nearby_microglia_radius_um: 30.0
+  min_nearby_microglia_count: 1
+  split_touching: false
+  min_peak_distance_px: 8
+  watershed_min_peak_height_px: 0.0
+  watershed_compactness: 0.0
+  exclude_boundary_plaques_from_table: true
+  boundary_margin_um: 0.0
+
+spatial:
+  # Every radius is cumulative and includes the plaque itself.
+  # [0, 15, 30] creates plaque+0–15 µm and plaque+0–30 µm regions.
+  ring_edges_um: [0, 30]
+
+microglia_count:
+  enabled: true
+  opening_radius_px: 0
+  closing_radius_px: 1
+  fill_holes: true
+  min_nucleus_area_um2: 10.0
+  max_nucleus_area_um2: 150.0
+  min_circularity: 0.20
+  min_solidity: 0.70
+  max_eccentricity: 0.98
+  split_touching: true
+  min_peak_distance_px: 3
+  perinuclear_radius_um: 3.0
+  min_iba1_positive_fraction: 0.15
+
+metadata:
+  mouse_id: null
+  genotype: null
+  region: null
+  section_id: null
+  sex: null
+
+batch:
+  metadata_csv: null
+  continue_on_error: true
+
+output:
+  save_masks: true
+  save_qc: true
+  save_processing_images: true
+  preview_max_dimension_px: 2200

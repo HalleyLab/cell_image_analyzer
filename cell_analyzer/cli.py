@@ -1,4 +1,4 @@
-"""Command-line interface for CZI inspection, configuration, and analysis."""
+"""Command-line interface for microscopy image inspection, configuration, and analysis."""
 
 from __future__ import annotations
 
@@ -8,22 +8,22 @@ from pathlib import Path
 from typing import Sequence
 
 from .config import create_default_config, save_yaml
-from .czi_io import inspect_czi
+from .image_io import inspect_image
 from .pipeline import run_analysis
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cell-analyzer",
-        description="Segment cell ROIs in CZI images and measure all channels.",
+        description="Segment cell ROIs in microscopy images and measure all channels.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    inspect_parser = subparsers.add_parser("inspect", help="Print CZI metadata as JSON.")
+    inspect_parser = subparsers.add_parser("inspect", help="Print image metadata as JSON.")
     inspect_parser.add_argument("czi_path", type=Path)
 
     config_parser = subparsers.add_parser(
-        "init-config", help="Create an editable YAML configuration from a CZI file."
+        "init-config", help="Create an editable YAML configuration from an image file."
     )
     config_parser.add_argument("czi_path", type=Path)
     config_parser.add_argument("--output", type=Path, default=Path("config.yaml"))
@@ -38,10 +38,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "inspect":
-        print(json.dumps(inspect_czi(args.czi_path).to_dict(), indent=2))
+        print(json.dumps(inspect_image(args.czi_path).to_dict(), indent=2))
         return 0
     if args.command == "init-config":
-        info = inspect_czi(args.czi_path)
+        info = inspect_image(args.czi_path)
         config = create_default_config(info, args.result_dir, zoom=args.zoom)
         save_yaml(config, args.output)
         print(f"Configuration written to {args.output.resolve()}")

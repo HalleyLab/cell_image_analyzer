@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "CZI cell segmentation, ImageJ ROI export, and per-channel fluorescence measurement"
 requires-python = ">=3.10,<3.15"
 dependencies = [
+  "bioio>=3.5,<4",
+  "bioio-bioformats>=2,<3",
   "ipywidgets>=8.1",
   "matplotlib>=3.8",
   "numpy>=1.26",
@@ -25,6 +27,8 @@ dependencies = [
 [project.scripts]
 cell-analyzer = "cell_analyzer.cli:main"
 cell-analyzer-gui = "cell_analyzer.gui:main"
+cell-fluorescence-analyzer = "brain_section_analyzer.cli:main"
+cell-fluorescence-analyzer-gui = "brain_section_analyzer.gui:main"
 
 [tool.setuptools.packages.find]
-include = ["cell_analyzer*"]
+include = ["cell_analyzer*", "brain_section_analyzer*"]

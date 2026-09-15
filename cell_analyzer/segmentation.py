@@ -18,6 +18,7 @@ def threshold_image(
     adaptive_block_size_px: int = 51,
     adaptive_offset: float = 0.0,
     threshold_scale: float = 1.0,
+    manual_threshold: float = 0.0,
     invert: bool = False,
 ) -> tuple[np.ndarray, float | None]:
     """Threshold an intensity image and return the mask and scalar threshold if any."""
@@ -30,6 +31,9 @@ def threshold_image(
     if method == "none":
         mask = np.ones(image.shape, dtype=bool)
         threshold: float | None = None
+    elif method == "manual":
+        threshold = float(manual_threshold)
+        mask = image >= threshold
     elif values.size == 0 or np.all(values == values[0]):
         threshold = float(values[0]) if values.size else 0.0
         if method in {"otsu", "yen", "triangle", "percentile"}:
@@ -62,7 +66,7 @@ def threshold_image(
         mask = image > local
     else:
         raise ValueError(
-            "Unknown threshold method. Use none, otsu, yen, triangle, percentile, "
+            "Unknown threshold method. Use none, manual, otsu, yen, triangle, percentile, "
             "or adaptive."
         )
     if invert:

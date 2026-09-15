@@ -13,8 +13,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .config import load_yaml, normalize_config, save_yaml, slugify
-from .czi_io import inspect_czi, read_czi_channels
+from .config import (
+    load_yaml,
+    normalize_config,
+    save_yaml,
+    segmentation_config_for_zoom,
+    slugify,
+)
+from .image_io import inspect_image, read_image_channels
 from .measurements import measure_rois
 from .preprocessing import preprocess_channel
 from .rois import export_rois, save_overlay
@@ -92,21 +98,28 @@ def run_analysis(
         if isinstance(config_or_path, (str, Path))
         else dict(config_or_path)
     )
-    czi_path = raw_config.get("input", {}).get("czi_path")
-    if not czi_path:
-        raise ValueError("input.czi_path is required.")
+    raw_input = raw_config.get("input", {})
+    image_path = raw_input.get("image_path") or raw_input.get("czi_path")
+    if not image_path:
+        raise ValueError("input.image_path (or legacy input.czi_path) is required.")
 
-    _notify(progress, "Inspecting CZI metadata...")
-    info = inspect_czi(czi_path)
+    _notify(progress, "Inspecting image metadata...")
+    info = inspect_image(
+        image_path,
+        pixel_size_um_x=raw_input.get("pixel_size_um_x"),
+        pixel_size_um_y=raw_input.get("pixel_size_um_y"),
+        image_width_um=raw_input.get("image_width_um"),
+        image_height_um=raw_input.get("image_height_um"),
+    )
     config = normalize_config(raw_config, info)
     input_config = config["input"]
     output_config = config["output"]
     output_dir = Path(input_config["output_dir"]).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    _notify(progress, "Reading requested scene and channels...")
-    images = read_czi_channels(
-        czi_path,
+    _notify(progress, "Reading image data...")
+    images = read_image_channels(
+        image_path,
         info,
         scene=int(input_config["scene"]),
         time_index=int(input_config["time_index"]),
@@ -122,11 +135,25 @@ def run_analysis(
     }
     segmentation_channel = int(input_config["segmentation_channel"])
     _notify(progress, f"Segmenting cells from channel {segmentation_channel}...")
+    runtime_segmentation = segmentation_config_for_zoom(
+        config["segmentation"], info, float(input_config["zoom"])
+    )
     labels, cleaned_mask, segmentation_diagnostics = segment_cells(
         processed[segmentation_channel].analysis_image,
-        config["segmentation"],
+        runtime_segmentation,
     )
     del cleaned_mask
+    segmentation_diagnostics.update(
+        {
+            "min_area_um2": config["segmentation"]["min_area_um2"],
+            "max_area_um2": config["segmentation"].get("max_area_um2"),
+            "effective_min_area_px": runtime_segmentation["min_area_px"],
+            "effective_max_area_px": runtime_segmentation.get("max_area_px"),
+            "effective_pixel_area_um2": runtime_segmentation[
+                "effective_pixel_area_um2"
+            ],
+        }
+    )
 
     _notify(progress, "Measuring every ROI across all channels...")
     measurements, summary, measurement_thresholds = measure_rois(
@@ -185,10 +212,12 @@ def run_analysis(
 
     used_config_path = output_dir / "config_used.yaml"
     save_yaml(config, used_config_path)
-    metadata_path = output_dir / "czi_metadata.json"
+    source = Path(image_path).expanduser().resolve()
+    metadata_name = "czi_metadata.json" if source.suffix.casefold() == ".czi" else "image_metadata.json"
+    metadata_path = output_dir / metadata_name
     metadata_path.write_text(json.dumps(info.to_dict(), indent=2), encoding="utf-8")
     result = {
-        "input_czi": str(Path(czi_path).expanduser().resolve()),
+        "input_image": str(source),
         "output_dir": str(output_dir),
         "roi_count": int(labels.max()),
         "segmentation_channel": segmentation_channel,
@@ -205,6 +234,8 @@ def run_analysis(
         },
         "warnings": info.warnings,
     }
+    if source.suffix.casefold() == ".czi":
+        result["input_czi"] = str(source)
     result_path = output_dir / "analysis_summary.json"
     result["files"]["analysis_summary"] = str(result_path)
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")

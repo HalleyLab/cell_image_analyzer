@@ -1,4 +1,4 @@
-"""Cell segmentation and per-channel ROI measurements."""
+"""Brain-section Aβ/Iba1/CD68 analysis."""
 
 import os
 import tempfile
@@ -21,8 +21,17 @@ for _name, _path in {
     os.environ[_name] = str(_path)
 tempfile.tempdir = str(_TEMP)
 
+from .analysis import analyze_arrays, run_analysis
 from .batch import run_batch_analysis
-from .pipeline import run_analysis
+from .config import create_default_config, load_config, save_config
 
-__all__ = ["run_analysis", "run_batch_analysis"]
+__all__ = [
+    "analyze_arrays",
+    "create_default_config",
+    "load_config",
+    "run_analysis",
+    "run_batch_analysis",
+    "save_config",
+]
+
 __version__ = "0.1.0"

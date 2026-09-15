@@ -24,6 +24,8 @@ def _measurement_mask(
         analysis_image,
         method=threshold_config.get("method", "otsu"),
         percentile=float(threshold_config.get("percentile", 95.0)),
+        threshold_scale=float(threshold_config.get("scale", 1.0)),
+        manual_threshold=float(threshold_config.get("value", 0.0)),
     )
 
 
@@ -92,9 +94,13 @@ def measure_rois(
             processed.analysis_image, channel_config
         )
         thresholds[column_id] = threshold
+        thresholded_raw = np.where(positive_mask, processed.raw, 0)
 
         if roi_count:
-            raw_means = ndi.mean(processed.raw, labels=labels, index=label_ids)
+            raw_means = ndi.mean(thresholded_raw, labels=labels, index=label_ids)
+            integrated_intensities = ndi.sum(
+                thresholded_raw, labels=labels, index=label_ids
+            )
             positive_counts = np.bincount(
                 labels[positive_mask].ravel(), minlength=roi_count + 1
             )[1 : roi_count + 1].astype(float)
@@ -103,14 +109,12 @@ def measure_rois(
             ].astype(float)
         else:
             raw_means = np.array([], dtype=float)
+            integrated_intensities = np.array([], dtype=float)
             positive_counts = np.array([], dtype=float)
             roi_counts = np.array([], dtype=float)
 
         table[f"{column_id}_mean_intensity"] = raw_means
-        table[f"{column_id}_positive_area_analysis_px"] = positive_counts
-        table[f"{column_id}_positive_area_source_px"] = (
-            positive_counts * area_scale_to_source
-        )
+        table[f"{column_id}_integrated_intensity"] = integrated_intensities
         table[f"{column_id}_positive_area_um2"] = (
             positive_counts * pixel_area_um2 if pixel_area_um2 else np.nan
         )

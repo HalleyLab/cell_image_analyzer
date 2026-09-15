@@ -16,8 +16,13 @@ from IPython.display import display
 from skimage import measure, segmentation
 
 from .batch import prepare_batch_config, run_batch_analysis
-from .config import normalize_config
-from .czi_io import inspect_czi, read_czi_channels
+from .config import normalize_config, segmentation_config_for_zoom
+from .image_io import (
+    MICROSCOPY_FILE_PATTERN,
+    SUPPORTED_IMAGE_SUFFIXES,
+    inspect_image,
+    read_image_channels,
+)
 from .preprocessing import preprocess_channel_steps
 from .segmentation import segment_cells_steps, threshold_image
 
@@ -57,11 +62,6 @@ def _preview_segmentation_config(config: dict[str, Any], scale: float) -> dict[s
     result["min_hole_area_px"] = max(
         0, round(float(result.get("min_hole_area_px", 0)) * scale**2)
     )
-    result["min_area_px"] = max(
-        1, round(float(result.get("min_area_px", 1)) * scale**2)
-    )
-    if result.get("max_area_px") is not None:
-        result["max_area_px"] = max(1, round(float(result["max_area_px"]) * scale**2))
     return result
 
 
@@ -70,10 +70,21 @@ class LiveTuningPanel:
 
     def __init__(self, config: dict[str, Any], max_preview_dimension: int = 1400) -> None:
         self.config = config
-        self.info = inspect_czi(config["input"]["czi_path"])
+        input_config = config.get("input", {})
+        image_path = input_config.get("image_path") or input_config.get("czi_path")
+        if not image_path:
+            raise ValueError("input.image_path (or legacy input.czi_path) is required.")
+        self.info = inspect_image(
+            image_path,
+            pixel_size_um_x=input_config.get("pixel_size_um_x"),
+            pixel_size_um_y=input_config.get("pixel_size_um_y"),
+            image_width_um=input_config.get("image_width_um"),
+            image_height_um=input_config.get("image_height_um"),
+        )
         normalized_config = normalize_config(config, self.info)
         self.config.clear()
         self.config.update(normalized_config)
+        self.single_channel = len(self.info.channels) == 1
         self.analysis_zoom = float(self.config["input"]["zoom"])
         scene_index = int(self.config["input"]["scene"])
         scene = next(item for item in self.info.scenes if item.index == scene_index)
@@ -87,7 +98,7 @@ class LiveTuningPanel:
         self._load_channel(int(self.parameter_channel.value))
         self._connect()
         self.status.value = (
-            "<b>Ready.</b> Click <b>Load preview</b> to read the selected CZI plane."
+            "<b>Ready.</b> Click <b>Load preview</b> to read the selected image."
         )
 
     @staticmethod
@@ -139,14 +150,30 @@ class LiveTuningPanel:
         self.segmentation_channel = self._dropdown(
             "Segmentation channel", channel_options, selected
         )
+        if self.single_channel:
+            self.parameter_channel.layout.display = "none"
+            self.segmentation_channel.layout.display = "none"
         first = self.config["channels"][str(selected)]
         measurement = first["measurement_threshold"]
         self.sigma = self._float_slider(
             "Gaussian sigma (px)", first["gaussian_sigma_px"], 0, 12, 0.1
         )
-        signal_methods = ("none", "otsu", "yen", "triangle", "percentile")
+        signal_methods = ("none", "manual", "otsu", "yen", "triangle", "percentile")
         self.signal_method = self._dropdown(
             "Signal area threshold", signal_methods, measurement.get("method", "otsu")
+        )
+        self.signal_value = widgets.FloatText(
+            description="Manual signal threshold",
+            value=float(measurement.get("value", 0.0)),
+            style={"description_width": "165px"},
+            layout=widgets.Layout(width="430px"),
+        )
+        self.signal_scale = self._float_slider(
+            "Signal threshold multiplier",
+            measurement.get("scale", 1.0),
+            0.1,
+            3.0,
+            0.02,
         )
         self.signal_percentile = self._float_slider(
             "Signal percentile", measurement.get("percentile", 95), 50, 100, 0.5
@@ -191,19 +218,19 @@ class LiveTuningPanel:
             max=100_000_000,
             style={"description_width": "165px"},
         )
-        self.min_area = widgets.BoundedIntText(
-            description="Minimum cell area (px^2)",
-            value=int(segment["min_area_px"]),
-            min=1,
-            max=100_000_000,
-            style={"description_width": "190px"},
+        self.min_area = widgets.BoundedFloatText(
+            description="Minimum cell area (µm²)",
+            value=float(segment["min_area_um2"]),
+            min=0.000001,
+            max=1_000_000_000,
+            style={"description_width": "195px"},
         )
-        self.max_area = widgets.BoundedIntText(
-            description="Maximum cell area (px^2; 0=none)",
-            value=int(segment.get("max_area_px") or 0),
+        self.max_area = widgets.BoundedFloatText(
+            description="Maximum cell area (µm²; 0=none)",
+            value=float(segment.get("max_area_um2") or 0.0),
             min=0,
-            max=100_000_000,
-            style={"description_width": "230px"},
+            max=1_000_000_000,
+            style={"description_width": "235px"},
         )
         self.circularity = self._float_slider(
             "Minimum circularity", segment["min_circularity"], 0, 1, 0.01
@@ -254,6 +281,8 @@ class LiveTuningPanel:
                 self.parameter_channel,
                 self.sigma,
                 self.signal_method,
+                self.signal_value,
+                self.signal_scale,
                 self.signal_percentile,
             ]
         )
@@ -287,14 +316,19 @@ class LiveTuningPanel:
             ]
         )
         self.accordion = widgets.Accordion(children=(channel_box, segmentation_box))
-        self.accordion.set_title(0, "Per-channel smoothing and signal area")
+        channel_title = (
+            "Image smoothing and signal area"
+            if self.single_channel
+            else "Per-channel smoothing and signal area"
+        )
+        self.accordion.set_title(0, channel_title)
         self.accordion.set_title(1, "Cell segmentation and size filters")
         self.accordion.selected_index = 1
         self.load_button = widgets.Button(
             description="Load preview",
             button_style="primary",
             icon="image",
-            tooltip="Read the configured CZI plane and draw the live preview",
+            tooltip="Read the configured image and draw the live preview",
         )
         self.status = widgets.HTML()
         self.output = widgets.Image(
@@ -307,9 +341,10 @@ class LiveTuningPanel:
 
     def _controls(self) -> tuple[widgets.Widget, ...]:
         return (
-            self.segmentation_channel,
             self.sigma,
             self.signal_method,
+            self.signal_value,
+            self.signal_scale,
             self.signal_percentile,
             self.cell_method,
             self.threshold_scale,
@@ -336,6 +371,9 @@ class LiveTuningPanel:
     def _connect(self) -> None:
         self.load_button.on_click(self._load_preview)
         self.parameter_channel.observe(self._change_parameter_channel, names="value")
+        self.segmentation_channel.observe(
+            self._change_segmentation_channel, names="value"
+        )
         for control in self._controls():
             control.observe(self._changed, names="value")
 
@@ -344,15 +382,25 @@ class LiveTuningPanel:
             self._load_channel(int(change["new"]))
             self.refresh()
 
+    def _change_segmentation_channel(self, change: dict[str, Any]) -> None:
+        if self._suspend:
+            return
+        channel_index = int(change["new"])
+        if int(self.parameter_channel.value) != channel_index:
+            self.parameter_channel.value = channel_index
+        else:
+            self.refresh()
+
     def _changed(self, change: dict[str, Any]) -> None:
         if not self._suspend:
+            self._update_signal_control_state()
             self.refresh()
 
     def _load_preview(self, button: widgets.Button) -> None:
         self.load_button.disabled = True
-        self.status.value = "<b>Loading CZI preview...</b>"
+        self.status.value = "<b>Loading image preview...</b>"
         try:
-            self.images = read_czi_channels(
+            self.images = read_image_channels(
                 self.info.path,
                 self.info,
                 scene=self.scene_index,
@@ -377,9 +425,18 @@ class LiveTuningPanel:
         try:
             self.sigma.value = float(item["gaussian_sigma_px"])
             self.signal_method.value = str(measurement.get("method", "otsu"))
+            self.signal_value.value = float(measurement.get("value", 0.0))
+            self.signal_scale.value = float(measurement.get("scale", 1.0))
             self.signal_percentile.value = float(measurement.get("percentile", 95))
+            self._update_signal_control_state()
         finally:
             self._suspend = False
+
+    def _update_signal_control_state(self) -> None:
+        method = str(self.signal_method.value)
+        self.signal_value.disabled = method != "manual"
+        self.signal_scale.disabled = method in {"none", "manual"}
+        self.signal_percentile.disabled = method != "percentile"
 
     def _store(self) -> None:
         channel_index = int(self.parameter_channel.value)
@@ -390,6 +447,8 @@ class LiveTuningPanel:
                 "measurement_threshold": {
                     "method": str(self.signal_method.value),
                     "percentile": float(self.signal_percentile.value),
+                    "scale": float(self.signal_scale.value),
+                    "value": float(self.signal_value.value),
                 },
             }
         )
@@ -406,8 +465,8 @@ class LiveTuningPanel:
                 "closing_radius_px": int(self.closing.value),
                 "fill_all_holes": bool(self.fill_holes.value),
                 "min_hole_area_px": int(self.hole_area.value),
-                "min_area_px": int(self.min_area.value),
-                "max_area_px": int(self.max_area.value) or None,
+                "min_area_um2": float(self.min_area.value),
+                "max_area_um2": float(self.max_area.value) or None,
                 "min_circularity": float(self.circularity.value),
                 "min_local_contrast_ratio": float(self.contrast.value),
                 "split_touching": bool(self.split.value),
@@ -429,7 +488,7 @@ class LiveTuningPanel:
             self._store()
             if self.images is None:
                 self.status.value = (
-                    "<b>Ready.</b> Click <b>Load preview</b> to read the selected CZI plane."
+                    "<b>Ready.</b> Click <b>Load preview</b> to read the selected image."
                 )
                 return
             parameter_index = int(self.parameter_channel.value)
@@ -449,9 +508,14 @@ class LiveTuningPanel:
                         self.config["channels"][str(segmentation_index)], self.pixel_scale
                     ),
                 )
+            preview_segmentation = segmentation_config_for_zoom(
+                self.config["segmentation"], self.info, self.preview_zoom
+            )
             labels, diagnostics, segmentation_steps = segment_cells_steps(
                 segmentation_processed.analysis_image,
-                _preview_segmentation_config(self.config["segmentation"], self.pixel_scale),
+                _preview_segmentation_config(
+                    preview_segmentation, self.pixel_scale
+                ),
             )
             measurement = self.config["channels"][str(parameter_index)][
                 "measurement_threshold"
@@ -460,6 +524,8 @@ class LiveTuningPanel:
                 parameter_processed.analysis_image,
                 method=measurement["method"],
                 percentile=float(measurement.get("percentile", 95)),
+                threshold_scale=float(measurement.get("scale", 1.0)),
+                manual_threshold=float(measurement.get("value", 0.0)),
             )
             self._draw(
                 parameter_index,
@@ -519,22 +585,41 @@ class LiveTuningPanel:
         )
         candidate_overlay[candidate_boundaries] = np.array([1.0, 0.85, 0.0])
         names = {channel.index: channel.name for channel in self.info.channels}
+        if self.single_channel:
+            raw_title = "1. Raw image"
+            smoothed_title = "2. Gaussian smoothed"
+            segmentation_title = "3. ROI segmentation input"
+            signal_title = "8. Positive signal inside shared ROIs"
+        else:
+            raw_title = (
+                f"1. Raw measurement channel: C{parameter_index} "
+                f"{names[parameter_index]}"
+            )
+            smoothed_title = f"2. Gaussian smoothed: C{parameter_index}"
+            segmentation_title = f"3. ROI segmentation input: C{segmentation_index}"
+            signal_title = f"8. C{parameter_index} positive signal inside shared ROIs"
 
         figure, axes = plt.subplots(2, 4, figsize=(18, 9))
         axes = axes.ravel()
         panels = [
-            (raw, "gray", f"1. Raw: C{parameter_index} {names[parameter_index]}", 0, 1),
+            (
+                raw,
+                "gray",
+                raw_title,
+                0,
+                1,
+            ),
             (
                 smoothed,
                 "gray",
-                "2. Gaussian smoothed",
+                smoothed_title,
                 0,
                 1,
             ),
             (
                 segment_image,
                 "gray",
-                f"3. Segmentation input: C{segmentation_index}",
+                segmentation_title,
                 0,
                 1,
             ),
@@ -554,7 +639,7 @@ class LiveTuningPanel:
             ),
             (candidate_overlay, None, "6. Watershed candidates", None, None),
             (roi_overlay, None, "7. Accepted cell boundaries", None, None),
-            (signal_overlay, None, "8. Positive signal inside ROIs", None, None),
+            (signal_overlay, None, signal_title, None, None),
         ]
         for axis, (image, cmap, title, minimum, maximum) in zip(axes, panels):
             axis.imshow(image, cmap=cmap, vmin=minimum, vmax=maximum)
@@ -608,24 +693,30 @@ class BatchTuningPanel:
         self.czi_paths: list[Path] = []
         self.file_configs: dict[str, dict[str, Any]] = {}
         self._switching = False
-        configured_path = config.get("input", {}).get("czi_path")
-        initial_paths = list(czi_paths or ([configured_path] if configured_path else []))
+        configured_input = config.get("input", {})
+        configured_path = configured_input.get("image_path") or configured_input.get("czi_path")
+        provided_paths = czi_paths
+        initial_paths = list(provided_paths or ([configured_path] if configured_path else []))
         configured_output = config.get("input", {}).get("output_dir")
         initial_output = output_root or configured_output or Path.cwd() / "batch_results"
         self._build(initial_output)
-        self._set_paths(initial_paths)
+        if initial_paths:
+            self._set_paths(initial_paths)
 
     def _build(self, output_root: str | Path) -> None:
         self.path_text = widgets.Textarea(
-            description="CZI files",
-            placeholder="One absolute .czi path per line",
+            description="Image files",
+            placeholder="One absolute microscopy image path per line",
             layout=widgets.Layout(width="100%", height="110px"),
             style={"description_width": "90px"},
         )
         self.select_button = widgets.Button(
-            description="Select CZI files",
+            description="Add images",
             button_style="info",
             icon="folder-open",
+            tooltip=(
+                "Add files to the current batch. Click again to add files from another folder."
+            ),
         )
         self.apply_paths_button = widgets.Button(
             description="Apply file list",
@@ -655,7 +746,7 @@ class BatchTuningPanel:
             button_style="success",
             icon="play",
         )
-        self.batch_status = widgets.HTML(value="<b>Select one or more CZI files.</b>")
+        self.batch_status = widgets.HTML(value="<b>Select one or more microscopy images.</b>")
         self.result_table = widgets.HTML()
         self.preview_container = widgets.VBox()
 
@@ -676,7 +767,7 @@ class BatchTuningPanel:
         batch_controls = widgets.VBox(
             (
                 widgets.HTML(
-                    "<h3>Multi-file CZI analysis</h3>"
+                    "<h3>Multi-file microscopy image analysis</h3>"
                     "<p>Each file remembers its own parameters. Select a file to preview "
                     "and tune it, or copy the current settings to the complete batch.</p>"
                 ),
@@ -704,13 +795,14 @@ class BatchTuningPanel:
             if key in seen:
                 continue
             if not path.is_file():
-                raise FileNotFoundError(f"CZI file not found: {path}")
-            if path.suffix.casefold() != ".czi":
-                raise ValueError(f"Expected a .czi file: {path}")
+                raise FileNotFoundError(f"Image file not found: {path}")
+            if path.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
+                supported = ", ".join(sorted(SUPPORTED_IMAGE_SUFFIXES))
+                raise ValueError(f"Expected one of {supported}: {path}")
             paths.append(path)
             seen.add(key)
         if not paths:
-            raise ValueError("Select at least one CZI file.")
+            raise ValueError("Select at least one supported microscopy image.")
         return paths
 
     def _set_paths(self, values: list[str | Path]) -> None:
@@ -756,13 +848,22 @@ class BatchTuningPanel:
             try:
                 selected = filedialog.askopenfilenames(
                     parent=root,
-                    title="Select CZI files",
-                    filetypes=(("CZI images", "*.czi"), ("All files", "*.*")),
+                    title="Select microscopy images",
+                    filetypes=(
+                        ("All supported microscopy images", MICROSCOPY_FILE_PATTERN),
+                        ("Zeiss CZI", "*.czi"),
+                        ("Leica", "*.lif *.lei *.scn *.lof *.xlef"),
+                        ("Olympus", "*.oir *.vsi *.oib *.oif"),
+                        ("OME/TIFF", "*.ome.tif *.ome.tiff *.tif *.tiff"),
+                        ("Nikon ND2", "*.nd2"),
+                        ("PNG images", "*.png"),
+                        ("All files", "*.*"),
+                    ),
                 )
             finally:
                 root.destroy()
             if selected:
-                self._set_paths(list(selected))
+                self._set_paths([*self.czi_paths, *selected])
         except Exception as error:
             self.batch_status.value = (
                 f"<span style='color:#b00020'><b>File dialog error:</b> "
@@ -777,7 +878,9 @@ class BatchTuningPanel:
             return
         self.current_panel._store()
         current = self.current_panel.config
-        key = str(Path(current["input"]["czi_path"]).resolve()).casefold()
+        current_input = current["input"]
+        current_path = current_input.get("image_path") or current_input.get("czi_path")
+        key = str(Path(current_path).resolve()).casefold()
         self.file_configs[key] = copy.deepcopy(current)
 
     def _copy_parameters_to_template(self, current: dict[str, Any]) -> None:
@@ -789,9 +892,19 @@ class BatchTuningPanel:
             "z_index",
             "zoom",
             "segmentation_channel",
+            "pixel_size_um_x",
+            "pixel_size_um_y",
+            "image_width_um",
+            "image_height_um",
         ):
-            self.config["input"][key] = copy.deepcopy(current["input"][key])
-        self.config["input"]["czi_path"] = current["input"]["czi_path"]
+            if key in current["input"]:
+                self.config["input"][key] = copy.deepcopy(current["input"][key])
+        current_path = current["input"].get("image_path") or current["input"].get("czi_path")
+        self.config["input"]["image_path"] = current_path
+        if Path(current_path).suffix.casefold() == ".czi":
+            self.config["input"]["czi_path"] = current_path
+        else:
+            self.config["input"].pop("czi_path", None)
         self.config["segmentation"] = copy.deepcopy(current["segmentation"])
         self.config["output"] = copy.deepcopy(current["output"])
         template_channels = self.config.setdefault("channels", {})
@@ -804,9 +917,9 @@ class BatchTuningPanel:
             if self.current_panel is None:
                 raise ValueError("Select and load a preview file first.")
             self._copy_parameters_to_template(self.current_panel.config)
-            current_key = str(
-                Path(self.current_panel.config["input"]["czi_path"]).resolve()
-            ).casefold()
+            current_input = self.current_panel.config["input"]
+            current_path = current_input.get("image_path") or current_input.get("czi_path")
+            current_key = str(Path(current_path).resolve()).casefold()
             current_config = copy.deepcopy(self.current_panel.config)
             self.file_configs.clear()
             self.file_configs[current_key] = current_config
@@ -914,7 +1027,7 @@ class BatchTuningPanel:
             self._snapshot_current()
             paths = list(self.czi_paths)
             if not paths:
-                raise ValueError("Select at least one CZI file.")
+                raise ValueError("Select at least one supported microscopy image.")
             output_root = Path(self.output_root_widget.value).expanduser().resolve()
             template = copy.deepcopy(self.config)
             per_file_configs = copy.deepcopy(self.file_configs)
@@ -983,12 +1096,17 @@ def launch_batch_tuning_widget(
     czi_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
     output_root: str | Path | None = None,
     max_preview_dimension: int = 1400,
+    *,
+    image_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
 ) -> BatchTuningPanel:
     """Return a multi-file selector, preview browser, and batch runner."""
 
+    if czi_paths is not None and image_paths is not None:
+        raise ValueError("Pass image_paths or czi_paths, not both.")
+    selected_paths = image_paths if image_paths is not None else czi_paths
     return BatchTuningPanel(
         config,
-        czi_paths=czi_paths,
+        czi_paths=selected_paths,
         output_root=output_root,
         max_preview_dimension=max_preview_dimension,
     )

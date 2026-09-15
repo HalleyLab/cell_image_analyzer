@@ -10,8 +10,8 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
-from .config import create_default_config, normalize_config, slugify
-from .czi_io import inspect_czi
+from .config import create_default_config, normalize_config, save_yaml, slugify
+from .image_io import SUPPORTED_IMAGE_SUFFIXES, inspect_image
 from .pipeline import run_analysis
 
 ProgressCallback = Callable[[str], None]
@@ -22,22 +22,23 @@ def _notify(callback: ProgressCallback | None, message: str) -> None:
         callback(message)
 
 
-def _normalize_paths(czi_paths: Iterable[str | Path]) -> list[Path]:
+def _normalize_paths(image_paths: Iterable[str | Path]) -> list[Path]:
     paths: list[Path] = []
     seen: set[str] = set()
-    for value in czi_paths:
+    for value in image_paths:
         path = Path(value).expanduser().resolve()
         key = str(path).casefold()
         if key in seen:
             continue
         if not path.is_file():
-            raise FileNotFoundError(f"CZI file not found: {path}")
-        if path.suffix.casefold() != ".czi":
-            raise ValueError(f"Expected a .czi file: {path}")
+            raise FileNotFoundError(f"Image file not found: {path}")
+        if path.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
+            supported = ", ".join(sorted(SUPPORTED_IMAGE_SUFFIXES))
+            raise ValueError(f"Expected one of {supported}: {path}")
         paths.append(path)
         seen.add(key)
     if not paths:
-        raise ValueError("Select at least one CZI file.")
+        raise ValueError("Select at least one supported microscopy image.")
     return paths
 
 
@@ -59,15 +60,21 @@ def _output_directories(paths: list[Path], output_root: Path) -> list[Path]:
 
 
 def prepare_batch_config(
-    czi_path: str | Path,
+    image_path: str | Path,
     template_config: dict[str, Any],
     output_dir: str | Path,
 ) -> dict[str, Any]:
-    """Adapt shared parameters to one CZI while preserving its metadata."""
+    """Adapt shared parameters to one image while preserving its metadata."""
 
-    source = Path(czi_path).expanduser().resolve()
-    info = inspect_czi(source)
+    source = Path(image_path).expanduser().resolve()
     template_input = template_config.get("input", {})
+    info = inspect_image(
+        source,
+        pixel_size_um_x=template_input.get("pixel_size_um_x"),
+        pixel_size_um_y=template_input.get("pixel_size_um_y"),
+        image_width_um=template_input.get("image_width_um"),
+        image_height_um=template_input.get("image_height_um"),
+    )
     zoom = float(template_input.get("zoom", 1.0))
     config = create_default_config(info, output_dir=output_dir, zoom=zoom)
 
@@ -77,11 +84,19 @@ def prepare_batch_config(
         "z_projection",
         "z_index",
         "zoom",
-        "segmentation_channel",
     ):
         if key in template_input:
             config["input"][key] = copy.deepcopy(template_input[key])
-    config["input"]["czi_path"] = str(source)
+    available_channels = {channel.index for channel in info.channels}
+    requested_channel = int(template_input.get("segmentation_channel", 0))
+    config["input"]["segmentation_channel"] = (
+        requested_channel if requested_channel in available_channels else info.channels[0].index
+    )
+    config["input"]["image_path"] = str(source)
+    if source.suffix.casefold() == ".czi":
+        config["input"]["czi_path"] = str(source)
+    else:
+        config["input"].pop("czi_path", None)
     config["input"]["output_dir"] = str(Path(output_dir).expanduser().resolve())
 
     if "segmentation" in template_config:
@@ -130,7 +145,7 @@ def run_batch_analysis(
     progress: ProgressCallback | None = print,
     continue_on_error: bool = True,
 ) -> dict[str, Any]:
-    """Analyze multiple CZI files and create per-file and combined outputs."""
+    """Analyze multiple microscopy images and create combined outputs."""
 
     paths = _normalize_paths(czi_paths)
     root = Path(output_root).expanduser().resolve()
@@ -144,6 +159,28 @@ def run_batch_analysis(
         for key, value in (per_file_configs or {}).items()
     }
 
+    selected_files_txt = root / "selected_image_files.txt"
+    selected_files_txt.write_text(
+        "\n".join(str(path) for path in paths) + "\n", encoding="utf-8"
+    )
+    batch_parameters_yaml = root / "batch_parameters.yaml"
+    batch_parameter_document: dict[str, Any] = {
+        "format_version": 2,
+        "selected_image_files": [str(path) for path in paths],
+        "output_root": str(root),
+        "template_config": copy.deepcopy(template_config),
+        "per_file_overrides": {
+            str(path): copy.deepcopy(specific_configs[str(path).casefold()])
+            for path in paths
+            if str(path).casefold() in specific_configs
+        },
+        "effective_file_configs": {},
+    }
+    if all(path.suffix.casefold() == ".czi" for path in paths):
+        # Preserve the legacy key for existing CZI-only workflows.
+        batch_parameter_document["selected_czi_files"] = [str(path) for path in paths]
+    save_yaml(batch_parameter_document, batch_parameters_yaml)
+
     for file_index, (path, output_dir) in enumerate(
         zip(paths, output_directories), start=1
     ):
@@ -152,6 +189,7 @@ def run_batch_analysis(
         try:
             file_template = specific_configs.get(str(path).casefold(), template_config)
             config = prepare_batch_config(path, file_template, output_dir)
+            batch_parameter_document["effective_file_configs"][str(path)] = copy.deepcopy(config)
             result = run_analysis(
                 config,
                 progress=lambda message, item=prefix: _notify(
@@ -196,6 +234,8 @@ def run_batch_analysis(
         records.append(record)
         _write_batch_summary(records, root)
 
+    save_yaml(batch_parameter_document, batch_parameters_yaml)
+
     summary = pd.DataFrame(records)
     summary_csv = root / "batch_summary.csv"
     summary_xlsx = root / "batch_summary.xlsx"
@@ -228,6 +268,8 @@ def run_batch_analysis(
             "batch_summary_xlsx": str(summary_xlsx),
             "combined_measurements_csv": str(combined_csv),
             "combined_measurements_xlsx": str(combined_xlsx),
+            "selected_files_txt": str(selected_files_txt),
+            "batch_parameters_yaml": str(batch_parameters_yaml),
         },
     }
     summary_json = root / "batch_analysis_summary.json"

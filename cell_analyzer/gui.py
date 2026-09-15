@@ -1,4 +1,4 @@
-"""Tkinter desktop interface for channel-specific CZI analysis settings."""
+"""Tkinter desktop interface for channel-specific microscopy analysis."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from .config import create_default_config, save_yaml
-from .czi_io import inspect_czi
+from .image_io import MICROSCOPY_FILE_PATTERN, inspect_image
 from .pipeline import run_analysis
 
 
@@ -24,7 +24,7 @@ class AnalyzerGui:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("CZI Cell Analyzer")
+        self.root.title("Microscopy Cell Analyzer")
         self.root.geometry("1180x760")
         self.info = None
         self.channel_variables: dict[int, dict[str, tk.Variable]] = {}
@@ -47,7 +47,7 @@ class AnalyzerGui:
         self.zoom = tk.StringVar(value="1.0")
         self.segmentation_channel = tk.StringVar(value="0")
 
-        ttk.Label(input_frame, text="CZI file").grid(row=0, column=0, sticky="w")
+        ttk.Label(input_frame, text="Image file").grid(row=0, column=0, sticky="w")
         ttk.Entry(input_frame, textvariable=self.czi_path).grid(
             row=0, column=1, columnspan=7, sticky="ew", padx=4
         )
@@ -83,7 +83,7 @@ class AnalyzerGui:
             widget.grid(row=2, column=column * 2 + 1, sticky="w", padx=(3, 12))
         input_frame.columnconfigure(1, weight=1)
 
-        self.metadata_label = ttk.Label(outer, text="Load a CZI file to discover its channels.")
+        self.metadata_label = ttk.Label(outer, text="Load a microscopy image to discover its channels.")
         self.metadata_label.pack(fill="x", pady=(6, 4))
 
         notebook = ttk.Notebook(outer)
@@ -119,8 +119,8 @@ class AnalyzerGui:
             "closing_radius_px": tk.StringVar(value="2"),
             "fill_all_holes": tk.BooleanVar(value=True),
             "min_hole_area_px": tk.StringVar(value="32"),
-            "min_area_px": tk.StringVar(value="50"),
-            "max_area_px": tk.StringVar(value=""),
+            "min_area_um2": tk.StringVar(value="5.0"),
+            "max_area_um2": tk.StringVar(value=""),
             "min_circularity": tk.StringVar(value="0.05"),
             "min_local_contrast_ratio": tk.StringVar(value="1.0"),
             "local_contrast_ring_px": tk.StringVar(value="4"),
@@ -163,8 +163,8 @@ class AnalyzerGui:
             ("Opening radius (px)", "opening_radius_px", None),
             ("Closing radius (px)", "closing_radius_px", None),
             ("Maximum filled hole (px)", "min_hole_area_px", None),
-            ("Minimum ROI area (px)", "min_area_px", None),
-            ("Maximum ROI area (blank = none)", "max_area_px", None),
+            ("Minimum ROI area (µm²)", "min_area_um2", None),
+            ("Maximum ROI area (µm²; blank = none)", "max_area_um2", None),
             ("Minimum circularity", "min_circularity", None),
             ("Minimum local contrast ratio", "min_local_contrast_ratio", None),
             ("Local contrast ring (px)", "local_contrast_ring_px", None),
@@ -213,7 +213,17 @@ class AnalyzerGui:
 
     def _browse_czi(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select a CZI file", filetypes=[("CZI image", "*.czi"), ("All files", "*.*")]
+            title="Select a microscopy image",
+            filetypes=[
+                ("All supported microscopy images", MICROSCOPY_FILE_PATTERN),
+                ("Zeiss CZI", "*.czi"),
+                ("Leica", "*.lif *.lei *.scn *.lof *.xlef"),
+                ("Olympus", "*.oir *.vsi *.oib *.oif"),
+                ("OME/TIFF", "*.ome.tif *.ome.tiff *.tif *.tiff"),
+                ("Nikon ND2", "*.nd2"),
+                ("PNG images", "*.png"),
+                ("All files", "*.*"),
+            ]
         )
         if path:
             self.czi_path.set(path)
@@ -226,7 +236,7 @@ class AnalyzerGui:
 
     def _inspect(self) -> None:
         try:
-            self.info = inspect_czi(self.czi_path.get())
+            self.info = inspect_image(self.czi_path.get())
             if not self.output_dir.get():
                 source = Path(self.info.path)
                 self.output_dir.set(str(source.with_name(f"{source.stem}_cell_analysis")))
@@ -241,9 +251,9 @@ class AnalyzerGui:
                     f"Channels: {channel_text} | Scenes: {len(self.info.scenes)}"
                 )
             )
-            self.status.set("CZI metadata loaded")
+            self.status.set("Image metadata loaded")
         except Exception as error:
-            messagebox.showerror("CZI inspection failed", str(error))
+            messagebox.showerror("Image inspection failed", str(error))
 
     def _populate_channels(self) -> None:
         for child in self.channel_table.winfo_children():
@@ -255,6 +265,8 @@ class AnalyzerGui:
             "Output alias",
             "Gaussian sigma",
             "Area threshold",
+            "Manual threshold",
+            "Threshold multiplier",
             "Threshold percentile",
         ]
         for column, text in enumerate(headers):
@@ -267,6 +279,8 @@ class AnalyzerGui:
                 "alias": tk.StringVar(value=channel.name),
                 "gaussian_sigma_px": tk.StringVar(value="1"),
                 "threshold_method": tk.StringVar(value="otsu"),
+                "threshold_value": tk.StringVar(value="0"),
+                "threshold_scale": tk.StringVar(value="1"),
                 "threshold_percentile": tk.StringVar(value="95"),
             }
             self.channel_variables[channel.index] = variables
@@ -283,13 +297,19 @@ class AnalyzerGui:
             ttk.Combobox(
                 self.channel_table,
                 textvariable=variables["threshold_method"],
-                values=("none", "otsu", "yen", "triangle", "percentile"),
+                values=("none", "manual", "otsu", "yen", "triangle", "percentile"),
                 state="readonly",
                 width=12,
             ).grid(row=row, column=4, padx=3)
             ttk.Entry(
-                self.channel_table, textvariable=variables["threshold_percentile"], width=13
+                self.channel_table, textvariable=variables["threshold_value"], width=13
             ).grid(row=row, column=5, padx=3)
+            ttk.Entry(
+                self.channel_table, textvariable=variables["threshold_scale"], width=13
+            ).grid(row=row, column=6, padx=3)
+            ttk.Entry(
+                self.channel_table, textvariable=variables["threshold_percentile"], width=13
+            ).grid(row=row, column=7, padx=3)
             channel_choices.append(f"{channel.index}: {channel.name}")
         self.segmentation_channel_box.configure(values=channel_choices)
         if channel_choices:
@@ -322,6 +342,8 @@ class AnalyzerGui:
                     "measurement_threshold": {
                         "method": str(variables["threshold_method"].get()),
                         "percentile": float(variables["threshold_percentile"].get()),
+                        "scale": float(variables["threshold_scale"].get()),
+                        "value": float(variables["threshold_value"].get()),
                     },
                 }
             )
@@ -334,20 +356,20 @@ class AnalyzerGui:
             "watershed_min_peak_height_px",
             "watershed_min_peak_prominence_px",
             "threshold_scale",
+            "min_area_um2",
         }
         string_int_keys = {
             "adaptive_block_size_px",
             "opening_radius_px",
             "closing_radius_px",
             "min_hole_area_px",
-            "min_area_px",
             "local_contrast_ring_px",
             "min_peak_distance_px",
             "border_exclusion_margin_px",
         }
         for key, variable in self.segmentation_variables.items():
             value = variable.get()
-            if key == "max_area_px":
+            if key == "max_area_um2":
                 config["segmentation"][key] = _optional_float(str(value))
             elif key in string_float_keys:
                 config["segmentation"][key] = float(value)

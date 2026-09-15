@@ -1,6 +1,6 @@
 input:
-  czi_path: D:/data/example.czi
-  output_dir: D:/data/cell_analysis_output
+  czi_path: I:/QIULAB/data/AD_PAC/AD-PAC_TSstain/20260130 PAC-AD-TS/PAC-cKO-AD1 ventral TS 10X0.5 Z+T FINAL.czi
+  output_dir: E:/projects/cell_analyzer/output/example
   scene: 0
   time_index: 0
   z_projection: max
@@ -18,8 +18,8 @@ segmentation:
   closing_radius_px: 2
   fill_all_holes: true
   min_hole_area_px: 32
-  min_area_px: 50
-  max_area_px: null
+  min_area_um2: 5.0
+  max_area_um2: null
   min_circularity: 0.05
   min_local_contrast_ratio: 1.0
   local_contrast_ring_px: 4
@@ -37,6 +37,8 @@ channels:
     measurement_threshold:
       method: otsu
       percentile: 95.0
+      scale: 1.0
+      value: 0.0
 output:
   save_imagej_rois: true
   save_geojson: true

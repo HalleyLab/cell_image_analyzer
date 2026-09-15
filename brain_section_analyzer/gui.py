@@ -1,0 +1,1032 @@
+"""Standalone Tk interface for cell fluorescence analysis."""
+
+from __future__ import annotations
+
+import copy
+import os
+import queue
+import re
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import colorchooser, filedialog, messagebox, ttk
+from typing import Any
+
+from PIL import Image, ImageTk
+
+from cell_analyzer.image_io import (
+    CACHE_DIRECTORY,
+    MICROSCOPY_FILE_PATTERN,
+    SUPPORTED_IMAGE_SUFFIXES,
+    configure_cache_directory,
+    inspect_image,
+)
+
+from .analysis import run_analysis
+from .batch import _resolve_mask, run_batch_analysis
+from .config import (
+    DEFAULT_CONFIG,
+    OUTPUT_SELECTION_DEFAULTS,
+    load_config,
+    normalize_config,
+    save_config,
+)
+
+
+ROLES = ("abeta", "iba1", "cd68", "dapi")
+ROLE_LABELS = dict(zip(ROLES, ("Channel 1", "Channel 2", "Channel 3", "Channel 4")))
+THRESHOLD_METHODS = ("manual", "otsu", "yen", "triangle", "percentile")
+
+
+def _optional_float(variable: tk.StringVar) -> float | None:
+    value = variable.get().strip()
+    return None if not value else float(value)
+
+
+def _safe_name(path: Path) -> str:
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", path.stem).strip(" ._") or "image"
+
+
+class BrainSectionGui:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Cell Analyzer")
+        self.root.geometry("1380x930")
+        self.image_paths: list[Path] = []
+        self.info = None
+        self.messages: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.channel_vars: dict[str, dict[str, tk.Variable]] = {}
+        self.marker_vars: dict[str, dict[str, tk.Variable]] = {}
+        self.preview_photo: ImageTk.PhotoImage | None = None
+        self.preview_path: Path | None = None
+        self._build()
+        self._apply_config(copy.deepcopy(DEFAULT_CONFIG))
+        self.root.after(100, self._poll_messages)
+
+    @staticmethod
+    def _entry_grid(
+        parent: ttk.Widget,
+        variables: dict[str, tk.Variable],
+        fields: list[tuple[str, str, tuple[str, ...] | None]],
+        *,
+        column: int = 0,
+    ) -> None:
+        for row, (label, key, choices) in enumerate(fields):
+            variable = variables[key]
+            if isinstance(variable, tk.BooleanVar):
+                ttk.Checkbutton(parent, text=label, variable=variable).grid(
+                    row=row, column=column, columnspan=2, sticky="w", padx=5, pady=3
+                )
+                continue
+            ttk.Label(parent, text=label).grid(row=row, column=column, sticky="w", padx=5, pady=3)
+            if choices:
+                widget = ttk.Combobox(
+                    parent, textvariable=variable, values=choices, state="readonly", width=24
+                )
+            else:
+                widget = ttk.Entry(parent, textvariable=variable, width=26)
+            widget.grid(row=row, column=column + 1, sticky="ew", padx=5, pady=3)
+
+    def _build(self) -> None:
+        outer = ttk.Frame(self.root, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        files_frame = ttk.LabelFrame(outer, text="Input microscopy images", padding=8)
+        files_frame.pack(fill="x")
+        self.file_list = tk.Listbox(files_frame, height=6, selectmode="extended")
+        self.file_list.grid(row=0, column=0, rowspan=5, sticky="nsew")
+        scrollbar = ttk.Scrollbar(files_frame, orient="vertical", command=self.file_list.yview)
+        scrollbar.grid(row=0, column=1, rowspan=5, sticky="ns")
+        self.file_list.configure(yscrollcommand=scrollbar.set)
+        ttk.Button(files_frame, text="Add images", command=self._add_images).grid(row=0, column=2, sticky="ew", padx=6)
+        ttk.Button(files_frame, text="Inspect selected image", command=self._inspect_selected).grid(row=1, column=2, sticky="ew", padx=6)
+        ttk.Button(files_frame, text="Remove selected", command=self._remove_images).grid(row=2, column=2, sticky="ew", padx=6)
+        ttk.Button(files_frame, text="Clear", command=self._clear_images).grid(row=3, column=2, sticky="ew", padx=6)
+        files_frame.columnconfigure(0, weight=1)
+
+        output_frame = ttk.LabelFrame(outer, text="Output and sample metadata", padding=8)
+        output_frame.pack(fill="x", pady=(8, 0))
+        self.output_root = tk.StringVar()
+        self.cache_root = tk.StringVar()
+        self.metadata_csv = tk.StringVar()
+        ttk.Label(output_frame, text="Output folder").grid(row=0, column=0, sticky="w")
+        ttk.Entry(output_frame, textvariable=self.output_root).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(output_frame, text="Browse", command=self._browse_output).grid(row=0, column=2)
+        ttk.Label(output_frame, text="Application cache folder").grid(row=1, column=0, sticky="w")
+        ttk.Entry(output_frame, textvariable=self.cache_root).grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Button(output_frame, text="Browse", command=self._browse_cache).grid(row=1, column=2)
+        ttk.Label(output_frame, text="Sample metadata CSV (optional)").grid(row=2, column=0, sticky="w")
+        ttk.Entry(output_frame, textvariable=self.metadata_csv).grid(row=2, column=1, sticky="ew", padx=4)
+        ttk.Button(output_frame, text="Browse", command=self._browse_metadata).grid(row=2, column=2)
+        output_frame.columnconfigure(1, weight=1)
+
+        self.metadata_label = ttk.Label(
+            outer, text="Add images, then inspect one to load channels and pixel size.", wraplength=1320
+        )
+        self.metadata_label.pack(fill="x", pady=(6, 2))
+
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True)
+        self.notebook = notebook
+        input_tab = ttk.Frame(notebook, padding=8)
+        channels_tab = ttk.Frame(notebook, padding=8)
+        plaque_tab = ttk.Frame(notebook, padding=8)
+        microglia_tab = ttk.Frame(notebook, padding=8)
+        output_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(input_tab, text="Image & ROI")
+        notebook.add(channels_tab, text="Channels")
+        notebook.add(plaque_tab, text="Primary Objects")
+        notebook.add(microglia_tab, text="Cell Counting")
+        notebook.add(output_tab, text="Outputs")
+        self.output_tab = output_tab
+        self._build_input_tab(input_tab)
+        self._build_channels_tab(channels_tab)
+        self._build_plaque_tab(plaque_tab)
+        self._build_microglia_tab(microglia_tab)
+        self._build_output_tab(output_tab)
+
+        controls = ttk.Frame(outer)
+        controls.pack(fill="x", pady=(8, 0))
+        ttk.Button(controls, text="Load parameters/session", command=self._load_session).pack(side="left", padx=3)
+        ttk.Button(controls, text="Save parameters YAML", command=self._save_parameters).pack(side="left", padx=3)
+        ttk.Button(controls, text="Save full session", command=self._save_session).pack(side="left", padx=3)
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(controls, textvariable=self.status).pack(side="left", padx=12)
+
+        self.log = tk.Text(outer, height=6, wrap="word", state="disabled")
+        self.log.pack(fill="x", pady=(6, 0))
+
+    def _build_input_tab(self, parent: ttk.Frame) -> None:
+        self.input_vars = {
+            "scene": tk.StringVar(value="0"),
+            "time_index": tk.StringVar(value="0"),
+            "z_projection": tk.StringVar(value="max"),
+            "z_index": tk.StringVar(value="0"),
+            "zoom": tk.StringVar(value="1.0"),
+            "preview_zoom": tk.StringVar(value="0.25"),
+            "pixel_size_um_x": tk.StringVar(),
+            "pixel_size_um_y": tk.StringVar(),
+            "image_width_um": tk.StringVar(),
+            "image_height_um": tk.StringVar(),
+        }
+        image_frame = ttk.LabelFrame(parent, text="Image plane and calibration", padding=8)
+        image_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self._entry_grid(
+            image_frame,
+            self.input_vars,
+            [
+                ("Scene", "scene", None),
+                ("Time index", "time_index", None),
+                ("Z projection", "z_projection", ("single", "max", "mean")),
+                ("Z index", "z_index", None),
+                ("Analysis zoom", "zoom", None),
+                ("Preview zoom", "preview_zoom", None),
+                ("X µm/pixel (if metadata is missing)", "pixel_size_um_x", None),
+                ("Y µm/pixel (if metadata is missing)", "pixel_size_um_y", None),
+                ("Whole-image width µm (optional)", "image_width_um", None),
+                ("Whole-image height µm (optional)", "image_height_um", None),
+            ],
+        )
+
+        self.roi_vars = {
+            "mode": tk.StringVar(value="full_image"),
+            "mask_directory": tk.StringVar(),
+            "mask_suffix": tk.StringVar(value="_mask.png"),
+            "invert_mask": tk.BooleanVar(value=False),
+        }
+        roi_frame = ttk.LabelFrame(parent, text="Analysis ROI", padding=8)
+        roi_frame.grid(row=0, column=1, sticky="nsew")
+        self._entry_grid(
+            roi_frame,
+            self.roi_vars,
+            [
+                ("ROI mode", "mode", ("full_image", "mask_directory")),
+                ("Mask directory", "mask_directory", None),
+                ("Mask filename suffix", "mask_suffix", None),
+                ("Invert mask", "invert_mask", None),
+            ],
+        )
+        ttk.Button(roi_frame, text="Browse mask directory", command=self._browse_mask_directory).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=5, pady=8
+        )
+        ttk.Label(
+            roi_frame,
+            text="Microscope pixel-size metadata is preferred; manual calibration is used only when metadata is missing.",
+            wraplength=500,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=5)
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+
+    @staticmethod
+    def _pick_color(variable: tk.StringVar) -> None:
+        selected = colorchooser.askcolor(color=variable.get(), title="Select channel color")[1]
+        if selected:
+            variable.set(selected.upper())
+
+    def _build_channels_tab(self, parent: ttk.Frame) -> None:
+        headers = (
+            "Channel", "Enabled", "Image channel", "Name", "Wavelength nm", "Color",
+            "Gaussian σ", "Threshold method", "Manual value", "Auto scale", "Percentile",
+        )
+        for column, label in enumerate(headers):
+            ttk.Label(parent, text=label).grid(row=0, column=column, sticky="w", padx=3, pady=4)
+        for row, role in enumerate(ROLES, start=1):
+            defaults = DEFAULT_CONFIG["channels"][role]
+            variables: dict[str, tk.Variable] = {
+                "enabled": tk.BooleanVar(value=role != "dapi"),
+                "index": tk.StringVar(value=str(row - 1)),
+                "alias": tk.StringVar(value=defaults["alias"]),
+                "wavelength_nm": tk.StringVar(),
+                "color": tk.StringVar(value=defaults["color"]),
+                "sigma": tk.StringVar(value="1.0"),
+                "method": tk.StringVar(value="otsu"),
+                "value": tk.StringVar(value="0"),
+                "scale": tk.StringVar(value="1.0"),
+                "percentile": tk.StringVar(value="95"),
+            }
+            self.channel_vars[role] = variables
+            ttk.Label(parent, text=ROLE_LABELS[role]).grid(row=row, column=0, sticky="w", padx=3)
+            check = ttk.Checkbutton(parent, variable=variables["enabled"])
+            check.grid(row=row, column=1)
+            if role != "dapi":
+                check.state(["disabled"])
+            variables["index_widget"] = ttk.Combobox(
+                parent, textvariable=variables["index"], state="readonly", width=18
+            )
+            variables["index_widget"].grid(row=row, column=2, padx=3, pady=4)
+            ttk.Entry(parent, textvariable=variables["alias"], width=13).grid(row=row, column=3, padx=3)
+            ttk.Entry(parent, textvariable=variables["wavelength_nm"], width=10).grid(row=row, column=4, padx=3)
+            color_frame = ttk.Frame(parent)
+            color_frame.grid(row=row, column=5, padx=3)
+            ttk.Entry(color_frame, textvariable=variables["color"], width=8).pack(side="left")
+            ttk.Button(color_frame, text="Pick", width=5, command=lambda value=variables["color"]: self._pick_color(value)).pack(side="left", padx=(2, 0))
+            ttk.Entry(parent, textvariable=variables["sigma"], width=8).grid(row=row, column=6, padx=3)
+            ttk.Combobox(parent, textvariable=variables["method"], values=THRESHOLD_METHODS, state="readonly", width=11).grid(row=row, column=7, padx=3)
+            ttk.Entry(parent, textvariable=variables["value"], width=10).grid(row=row, column=8, padx=3)
+            ttk.Entry(parent, textvariable=variables["scale"], width=8).grid(row=row, column=9, padx=3)
+            ttk.Entry(parent, textvariable=variables["percentile"], width=8).grid(row=row, column=10, padx=3)
+
+        ttk.Label(parent, text="These channel settings are applied to every selected file.").grid(row=5, column=0, columnspan=11, sticky="w", padx=4, pady=(4, 0))
+        for column, role in enumerate(("iba1", "cd68")):
+            variables = {
+                "enabled": tk.BooleanVar(value=True),
+                "opening_radius_px": tk.StringVar(value="0"),
+                "closing_radius_px": tk.StringVar(value="0"),
+                "fill_holes": tk.BooleanVar(value=False),
+                "max_hole_area_um2": tk.StringVar(value="0"),
+                "min_area_um2": tk.StringVar(value="0"),
+                "max_area_um2": tk.StringVar(),
+                "min_circularity": tk.StringVar(value="0"),
+                "min_solidity": tk.StringVar(value="0"),
+                "max_eccentricity": tk.StringVar(value="1"),
+            }
+            self.marker_vars[role] = variables
+            frame = ttk.LabelFrame(parent, text=f"{ROLE_LABELS[role]} object filter", padding=8)
+            frame.grid(row=6, column=column * 6, columnspan=5, sticky="nsew", padx=5, pady=12)
+            self._entry_grid(
+                frame,
+                variables,
+                [
+                    ("Enable object filtering", "enabled", None),
+                    ("Open px", "opening_radius_px", None),
+                    ("Close px", "closing_radius_px", None),
+                    ("Fill holes", "fill_holes", None),
+                    ("Maximum filled-hole area µm²", "max_hole_area_um2", None),
+                    ("Minimum area µm²", "min_area_um2", None),
+                    ("Maximum area µm² (blank = unlimited)", "max_area_um2", None),
+                    ("Minimum circularity", "min_circularity", None),
+                    ("Minimum solidity", "min_solidity", None),
+                    ("Maximum eccentricity", "max_eccentricity", None),
+                ],
+            )
+
+    def _build_plaque_tab(self, parent: ttk.Frame) -> None:
+        self.plaque_vars = {
+            "opening_radius_px": tk.StringVar(value="0"),
+            "closing_radius_px": tk.StringVar(value="1"),
+            "fill_holes": tk.BooleanVar(value=False),
+            "max_hole_area_um2": tk.StringVar(value="0"),
+            "min_area_um2": tk.StringVar(value="10"),
+            "max_area_um2": tk.StringVar(),
+            "min_circularity": tk.StringVar(value="0"),
+            "min_solidity": tk.StringVar(value="0"),
+            "max_eccentricity": tk.StringVar(value="1"),
+            "neuron_exclusion_mode": tk.StringVar(value="shape_and_dark_center"),
+            "neuron_detection_threshold_scale": tk.StringVar(value="0.75"),
+            "neuron_min_diameter_um": tk.StringVar(value="8"),
+            "neuron_max_diameter_um": tk.StringVar(value="28"),
+            "neuron_min_circularity": tk.StringVar(value="0.35"),
+            "neuron_min_solidity": tk.StringVar(value="0.60"),
+            "neuron_min_hole_fraction": tk.StringVar(value="0.03"),
+            "neuron_max_center_shell_ratio": tk.StringVar(value="0.95"),
+            "require_nearby_microglia": tk.BooleanVar(value=False),
+            "nearby_microglia_radius_um": tk.StringVar(value="30"),
+            "min_nearby_microglia_count": tk.StringVar(value="1"),
+            "split_touching": tk.BooleanVar(value=False),
+            "min_peak_distance_px": tk.StringVar(value="8"),
+            "watershed_min_peak_height_px": tk.StringVar(value="0"),
+            "watershed_compactness": tk.StringVar(value="0"),
+            "exclude_boundary_plaques_from_table": tk.BooleanVar(value=True),
+            "boundary_margin_um": tk.StringVar(value="0"),
+            "ring_edges_um": tk.StringVar(value="0,30"),
+        }
+        frames = [
+            ("Primary-object morphology", [
+                ("Open px", "opening_radius_px", None),
+                ("Close px", "closing_radius_px", None),
+                ("Fill holes", "fill_holes", None),
+                ("Maximum filled-hole area µm²", "max_hole_area_um2", None),
+                ("Minimum area µm²", "min_area_um2", None),
+                ("Maximum area µm² (blank = unlimited)", "max_area_um2", None),
+                ("Minimum circularity", "min_circularity", None),
+                ("Minimum solidity", "min_solidity", None),
+                ("Maximum eccentricity", "max_eccentricity", None),
+            ]),
+            ("Round/hollow-object exclusion", [
+                ("Exclusion mode", "neuron_exclusion_mode", ("off", "shape", "shape_and_dark_center")),
+                ("Detection threshold scale", "neuron_detection_threshold_scale", None),
+                ("Minimum diameter µm", "neuron_min_diameter_um", None),
+                ("Maximum diameter µm", "neuron_max_diameter_um", None),
+                ("Minimum circularity", "neuron_min_circularity", None),
+                ("Minimum solidity", "neuron_min_solidity", None),
+                ("Minimum hole fraction", "neuron_min_hole_fraction", None),
+                ("Maximum center/shell intensity ratio", "neuron_max_center_shell_ratio", None),
+            ]),
+            ("Cell gating, splitting, and distance rings", [
+                ("Require nearby cells", "require_nearby_microglia", None),
+                ("Nearby-cell radius µm", "nearby_microglia_radius_um", None),
+                ("Minimum nearby-cell count", "min_nearby_microglia_count", None),
+                ("Split touching primary objects", "split_touching", None),
+                ("Minimum peak distance px", "min_peak_distance_px", None),
+                ("Minimum peak height px", "watershed_min_peak_height_px", None),
+                ("Watershed compactness", "watershed_compactness", None),
+                ("Exclude boundary primary objects from table", "exclude_boundary_plaques_from_table", None),
+                ("Boundary margin µm", "boundary_margin_um", None),
+                ("Cumulative ranges µm (e.g. 0,15,30)", "ring_edges_um", None),
+            ]),
+        ]
+        for column, (title, fields) in enumerate(frames):
+            frame = ttk.LabelFrame(parent, text=title, padding=8)
+            frame.grid(row=0, column=column, sticky="nsew", padx=5)
+            self._entry_grid(frame, self.plaque_vars, fields)
+            parent.columnconfigure(column, weight=1)
+
+    def _build_microglia_tab(self, parent: ttk.Frame) -> None:
+        self.microglia_vars = {
+            "enabled": tk.BooleanVar(value=False),
+            "opening_radius_px": tk.StringVar(value="0"),
+            "closing_radius_px": tk.StringVar(value="1"),
+            "fill_holes": tk.BooleanVar(value=True),
+            "min_nucleus_area_um2": tk.StringVar(value="10"),
+            "max_nucleus_area_um2": tk.StringVar(value="150"),
+            "min_circularity": tk.StringVar(value="0.2"),
+            "min_solidity": tk.StringVar(value="0.7"),
+            "max_eccentricity": tk.StringVar(value="0.98"),
+            "split_touching": tk.BooleanVar(value=True),
+            "min_peak_distance_px": tk.StringVar(value="3"),
+            "perinuclear_radius_um": tk.StringVar(value="3"),
+            "min_iba1_positive_fraction": tk.StringVar(value="0.15"),
+        }
+        frame = ttk.LabelFrame(parent, text="Channel 4 nuclei + perinuclear Channel 2 cell detection", padding=8)
+        frame.grid(row=0, column=0, sticky="nsew")
+        self._entry_grid(
+            frame,
+            self.microglia_vars,
+            [
+                ("Enable cell counting", "enabled", None),
+                ("Nucleus open px", "opening_radius_px", None),
+                ("Nucleus close px", "closing_radius_px", None),
+                ("Fill nucleus holes", "fill_holes", None),
+                ("Minimum nucleus area µm²", "min_nucleus_area_um2", None),
+                ("Maximum nucleus area µm²", "max_nucleus_area_um2", None),
+                ("Minimum nucleus circularity", "min_circularity", None),
+                ("Minimum nucleus solidity", "min_solidity", None),
+                ("Maximum nucleus eccentricity", "max_eccentricity", None),
+                ("Split touching nuclei", "split_touching", None),
+                ("Minimum nucleus peak distance px", "min_peak_distance_px", None),
+                ("Perinuclear radius µm", "perinuclear_radius_um", None),
+                ("Minimum perinuclear Channel 2-positive fraction", "min_iba1_positive_fraction", None),
+            ],
+        )
+        ttk.Label(
+            parent,
+            text="Channel 4 must also be enabled. Cells inside primary objects are included in cumulative ranges.",
+            wraplength=700,
+        ).grid(row=1, column=0, sticky="w", padx=5, pady=10)
+
+    def _build_output_tab(self, parent: ttk.Frame) -> None:
+        self.output_vars = {
+            key: tk.BooleanVar(value=value)
+            for key, value in OUTPUT_SELECTION_DEFAULTS.items()
+        }
+        self.output_vars.update(
+            {
+                "ring_boundary_width_px": tk.StringVar(value="1"),
+                "preview_max_dimension_px": tk.StringVar(value="2200"),
+                "continue_on_error": tk.BooleanVar(value=True),
+                "open_output": tk.BooleanVar(value=True),
+            }
+        )
+
+        table_frame = ttk.LabelFrame(parent, text="Tables", padding=8)
+        table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        table_outputs = (
+            ("Excel workbook", "save_excel"),
+            ("Image summary CSV", "save_image_summary_csv"),
+            ("Primary-object measurements CSV", "save_primary_objects_csv"),
+            ("Channel 1 candidate QC CSV", "save_candidate_qc_csv"),
+            ("Channel-object QC CSV", "save_channel_objects_csv"),
+            ("Cell measurements CSV", "save_cells_csv"),
+            ("Primary-object ring metrics CSV", "save_ring_metrics_csv"),
+            ("Animal summary CSV", "save_animal_summary_csv"),
+        )
+        for row, (label, key) in enumerate(table_outputs):
+            ttk.Checkbutton(table_frame, text=label, variable=self.output_vars[key]).grid(
+                row=row, column=0, sticky="w", pady=2
+            )
+
+        image_frame = ttk.LabelFrame(parent, text="Images and masks", padding=8)
+        image_frame.grid(row=0, column=1, sticky="nsew", padx=5)
+        image_outputs = (
+            ("Overview QC image", "save_qc"),
+            ("Raw channel preview images", "save_raw_channel_images"),
+            ("Composite image", "save_composite_image"),
+            ("Segmentation overlay images", "save_segmentation_images"),
+            ("Mask preview images", "save_mask_images"),
+            ("Tissue ROI mask TIFF", "save_tissue_mask"),
+            ("Primary-object label TIFF", "save_primary_object_labels"),
+            ("Excluded-object mask TIFFs", "save_excluded_object_masks"),
+            ("Channel-object label TIFF", "save_channel_object_labels"),
+            ("Channel 4 / cell label TIFFs", "save_cell_labels"),
+            ("Positive-mask TIFF", "save_positive_masks"),
+        )
+        for row, (label, key) in enumerate(image_outputs):
+            ttk.Checkbutton(image_frame, text=label, variable=self.output_vars[key]).grid(
+                row=row, column=0, sticky="w", pady=2
+            )
+
+        preview_frame = ttk.LabelFrame(parent, text="Processed preview", padding=8)
+        preview_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        self.preview_label = tk.Label(
+            preview_frame,
+            text="Select an image, then run Preview selected image.",
+            background="#111111",
+            foreground="white",
+            anchor="center",
+        )
+        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.open_preview_button = ttk.Button(
+            preview_frame,
+            text="Open preview image",
+            command=self._open_preview,
+            state="disabled",
+        )
+        self.open_preview_button.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.columnconfigure(0, weight=1)
+
+        run_frame = ttk.LabelFrame(parent, text="Run", padding=8)
+        run_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.preview_button = ttk.Button(
+            run_frame, text="Preview selected image", command=self._preview
+        )
+        self.preview_button.grid(row=0, column=0, padx=(0, 5))
+        self.run_button = ttk.Button(run_frame, text="Run all images", command=self._run)
+        self.run_button.grid(row=0, column=1, padx=5)
+        ttk.Checkbutton(
+            run_frame,
+            text="Continue after a file fails",
+            variable=self.output_vars["continue_on_error"],
+        ).grid(row=0, column=2, padx=12)
+        ttk.Checkbutton(
+            run_frame,
+            text="Open output folder when complete",
+            variable=self.output_vars["open_output"],
+        ).grid(row=0, column=3, padx=12)
+        ttk.Label(run_frame, text="Boundary width px").grid(row=0, column=4, padx=(12, 3))
+        ttk.Entry(
+            run_frame, textvariable=self.output_vars["ring_boundary_width_px"], width=7
+        ).grid(row=0, column=5)
+        ttk.Label(run_frame, text="Max image dimension px").grid(row=0, column=6, padx=(12, 3))
+        ttk.Entry(
+            run_frame, textvariable=self.output_vars["preview_max_dimension_px"], width=8
+        ).grid(row=0, column=7)
+        ttk.Label(
+            run_frame,
+            text="Run parameters and selected file paths are always saved.",
+        ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(7, 0))
+
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(2, weight=1)
+
+    def _selected_path(self) -> Path:
+        if not self.image_paths:
+            raise ValueError("Add at least one image first.")
+        selected = self.file_list.curselection()
+        return self.image_paths[selected[0] if selected else 0]
+
+    def _add_images(self) -> None:
+        values = filedialog.askopenfilenames(
+            title="Select microscopy images",
+            filetypes=[
+                ("All supported microscopy images", MICROSCOPY_FILE_PATTERN),
+                ("Zeiss CZI", "*.czi"),
+                ("Leica", "*.lif *.lei *.scn *.lof *.xlef"),
+                ("Olympus", "*.oir *.vsi *.oib *.oif"),
+                ("OME/TIFF", "*.ome.tif *.ome.tiff *.tif *.tiff"),
+                ("Nikon ND2", "*.nd2"),
+                ("All files", "*.*"),
+            ],
+        )
+        existing = {str(path).casefold() for path in self.image_paths}
+        for value in values:
+            path = Path(value).resolve()
+            if path.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
+                continue
+            if str(path).casefold() not in existing:
+                self.image_paths.append(path)
+                existing.add(str(path).casefold())
+        self._refresh_files()
+        if self.image_paths and self.info is None:
+            self.file_list.selection_clear(0, tk.END)
+            self.file_list.selection_set(0)
+
+    def _remove_images(self) -> None:
+        selected = set(self.file_list.curselection())
+        self.image_paths = [path for index, path in enumerate(self.image_paths) if index not in selected]
+        self.info = None
+        self._refresh_files()
+
+    def _clear_images(self) -> None:
+        self.image_paths.clear()
+        self.info = None
+        self._refresh_files()
+
+    def _refresh_files(self) -> None:
+        self.file_list.delete(0, tk.END)
+        for path in self.image_paths:
+            self.file_list.insert(tk.END, str(path))
+        self.status.set(f"{len(self.image_paths)} image(s) selected")
+
+    def _inspect_selected(self) -> None:
+        try:
+            source = self._selected_path()
+            cache_value = self.cache_root.get().strip()
+            if cache_value:
+                configure_cache_directory(cache_value)
+            self.info = inspect_image(
+                source,
+                pixel_size_um_x=_optional_float(self.input_vars["pixel_size_um_x"]),
+                pixel_size_um_y=_optional_float(self.input_vars["pixel_size_um_y"]),
+                image_width_um=_optional_float(self.input_vars["image_width_um"]),
+                image_height_um=_optional_float(self.input_vars["image_height_um"]),
+            )
+            if len(self.info.channels) < 3:
+                raise ValueError(f"Cell analysis requires at least 3 channels; this file has {len(self.info.channels)}.")
+            choices = [f"{channel.index}: {channel.name}" for channel in self.info.channels]
+            available = {channel.index for channel in self.info.channels}
+            for role in ROLES:
+                variables = self.channel_vars[role]
+                variables["index_widget"].configure(values=choices)
+                try:
+                    current = int(str(variables["index"].get()).split(":", 1)[0])
+                except ValueError:
+                    current = -1
+                index = current if current in available else self.info.channels[min(ROLES.index(role), len(self.info.channels) - 1)].index
+                match = next((choice for choice in choices if choice.startswith(f"{index}:")), choices[0])
+                variables["index"].set(match)
+            if not self.input_vars["pixel_size_um_x"].get() and self.info.pixel_size_um_x:
+                self.input_vars["pixel_size_um_x"].set(str(self.info.pixel_size_um_x))
+            if not self.input_vars["pixel_size_um_y"].get() and self.info.pixel_size_um_y:
+                self.input_vars["pixel_size_um_y"].set(str(self.info.pixel_size_um_y))
+            dims = self.info.dimensions
+            self.metadata_label.configure(
+                text=(
+                    f"{source.name} | {dims.get('X', (0, 0))[1]} × {dims.get('Y', (0, 0))[1]} px | "
+                    f"Channels: {', '.join(choices)} | Pixel size: {self.info.pixel_size_um_x} × "
+                    f"{self.info.pixel_size_um_y} µm"
+                )
+            )
+            self.status.set("Image metadata loaded")
+        except Exception as error:
+            messagebox.showerror("Could not read image", str(error))
+
+    def _browse_output(self) -> None:
+        value = filedialog.askdirectory(title="Select output folder")
+        if value:
+            self.output_root.set(value)
+
+    def _browse_cache(self) -> None:
+        value = filedialog.askdirectory(title="Select application cache folder")
+        if value:
+            self.cache_root.set(value)
+
+    def _browse_metadata(self) -> None:
+        value = filedialog.askopenfilename(title="Select sample metadata CSV", filetypes=[("CSV", "*.csv")])
+        if value:
+            self.metadata_csv.set(value)
+
+    def _browse_mask_directory(self) -> None:
+        value = filedialog.askdirectory(title="Select tissue-mask directory")
+        if value:
+            self.roi_vars["mask_directory"].set(value)
+
+    def _build_config(
+        self, source: Path | None = None, *, require_runtime_paths: bool = False
+    ) -> dict[str, Any]:
+        source = source or self._selected_path()
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        output_value = self.output_root.get().strip()
+        cache_value = self.cache_root.get().strip()
+        if require_runtime_paths and not output_value:
+            raise ValueError("Select an output folder.")
+        if require_runtime_paths and not cache_value:
+            raise ValueError("Select an application cache folder.")
+        output_root = (
+            Path(output_value).expanduser().resolve()
+            if output_value
+            else source.with_name(f"{source.stem}_cell_analysis")
+        )
+        config["application"]["cache_directory"] = (
+            str(configure_cache_directory(cache_value)) if cache_value else None
+        )
+        config["input"].update(
+            {
+                "image_path": str(source),
+                "output_dir": str(output_root / _safe_name(source)),
+                "scene": int(self.input_vars["scene"].get()),
+                "time_index": int(self.input_vars["time_index"].get()),
+                "z_projection": self.input_vars["z_projection"].get(),
+                "z_index": int(self.input_vars["z_index"].get()),
+                "zoom": float(self.input_vars["zoom"].get()),
+                "pixel_size_um_x": _optional_float(self.input_vars["pixel_size_um_x"]),
+                "pixel_size_um_y": _optional_float(self.input_vars["pixel_size_um_y"]),
+                "image_width_um": _optional_float(self.input_vars["image_width_um"]),
+                "image_height_um": _optional_float(self.input_vars["image_height_um"]),
+            }
+        )
+        for role in ROLES:
+            variables = self.channel_vars[role]
+            config["channels"][role].update(
+                {
+                    "index": int(str(variables["index"].get()).split(":", 1)[0]),
+                    "alias": variables["alias"].get().strip(),
+                    "wavelength_nm": _optional_float(variables["wavelength_nm"]),
+                    "color": variables["color"].get().strip(),
+                    "gaussian_sigma_px": float(variables["sigma"].get()),
+                    "threshold": {
+                        "method": variables["method"].get(),
+                        "value": float(variables["value"].get()),
+                        "scale": float(variables["scale"].get()),
+                        "percentile": float(variables["percentile"].get()),
+                    },
+                }
+            )
+        config["channels"]["dapi"]["enabled"] = bool(self.channel_vars["dapi"]["enabled"].get())
+        for role in ("iba1", "cd68"):
+            variables = self.marker_vars[role]
+            config["channels"][role]["object_filter"].update(
+                {
+                    "enabled": bool(variables["enabled"].get()),
+                    "opening_radius_px": int(variables["opening_radius_px"].get()),
+                    "closing_radius_px": int(variables["closing_radius_px"].get()),
+                    "fill_holes": bool(variables["fill_holes"].get()),
+                    "max_hole_area_um2": float(variables["max_hole_area_um2"].get()),
+                    "min_area_um2": float(variables["min_area_um2"].get()),
+                    "max_area_um2": _optional_float(variables["max_area_um2"]),
+                    "min_circularity": float(variables["min_circularity"].get()),
+                    "min_solidity": float(variables["min_solidity"].get()),
+                    "max_eccentricity": float(variables["max_eccentricity"].get()),
+                }
+            )
+        config["tissue_roi"].update(
+            {
+                "mode": self.roi_vars["mode"].get(),
+                "mask_directory": self.roi_vars["mask_directory"].get().strip() or None,
+                "mask_suffix": self.roi_vars["mask_suffix"].get(),
+                "invert_mask": bool(self.roi_vars["invert_mask"].get()),
+            }
+        )
+        plaque = self.plaque_vars
+        config["plaque"].update(
+            {
+                "opening_radius_px": int(plaque["opening_radius_px"].get()),
+                "closing_radius_px": int(plaque["closing_radius_px"].get()),
+                "fill_holes": bool(plaque["fill_holes"].get()),
+                "max_hole_area_um2": float(plaque["max_hole_area_um2"].get()),
+                "min_area_um2": float(plaque["min_area_um2"].get()),
+                "max_area_um2": _optional_float(plaque["max_area_um2"]),
+                "min_circularity": float(plaque["min_circularity"].get()),
+                "min_solidity": float(plaque["min_solidity"].get()),
+                "max_eccentricity": float(plaque["max_eccentricity"].get()),
+                "neuron_exclusion_mode": plaque["neuron_exclusion_mode"].get(),
+                "neuron_detection_threshold_scale": float(plaque["neuron_detection_threshold_scale"].get()),
+                "neuron_min_diameter_um": float(plaque["neuron_min_diameter_um"].get()),
+                "neuron_max_diameter_um": float(plaque["neuron_max_diameter_um"].get()),
+                "neuron_min_circularity": float(plaque["neuron_min_circularity"].get()),
+                "neuron_min_solidity": float(plaque["neuron_min_solidity"].get()),
+                "neuron_min_hole_fraction": float(plaque["neuron_min_hole_fraction"].get()),
+                "neuron_max_center_shell_ratio": float(plaque["neuron_max_center_shell_ratio"].get()),
+                "require_nearby_microglia": bool(plaque["require_nearby_microglia"].get()),
+                "nearby_microglia_radius_um": float(plaque["nearby_microglia_radius_um"].get()),
+                "min_nearby_microglia_count": int(plaque["min_nearby_microglia_count"].get()),
+                "split_touching": bool(plaque["split_touching"].get()),
+                "min_peak_distance_px": int(plaque["min_peak_distance_px"].get()),
+                "watershed_min_peak_height_px": float(plaque["watershed_min_peak_height_px"].get()),
+                "watershed_compactness": float(plaque["watershed_compactness"].get()),
+                "exclude_boundary_plaques_from_table": bool(plaque["exclude_boundary_plaques_from_table"].get()),
+                "boundary_margin_um": float(plaque["boundary_margin_um"].get()),
+            }
+        )
+        config["spatial"]["ring_edges_um"] = [
+            float(value.strip()) for value in plaque["ring_edges_um"].get().split(",") if value.strip()
+        ]
+        microglia = self.microglia_vars
+        config["microglia_count"].update(
+            {
+                "enabled": bool(microglia["enabled"].get()),
+                "opening_radius_px": int(microglia["opening_radius_px"].get()),
+                "closing_radius_px": int(microglia["closing_radius_px"].get()),
+                "fill_holes": bool(microglia["fill_holes"].get()),
+                "min_nucleus_area_um2": float(microglia["min_nucleus_area_um2"].get()),
+                "max_nucleus_area_um2": _optional_float(microglia["max_nucleus_area_um2"]),
+                "min_circularity": float(microglia["min_circularity"].get()),
+                "min_solidity": float(microglia["min_solidity"].get()),
+                "max_eccentricity": float(microglia["max_eccentricity"].get()),
+                "split_touching": bool(microglia["split_touching"].get()),
+                "min_peak_distance_px": int(microglia["min_peak_distance_px"].get()),
+                "perinuclear_radius_um": float(microglia["perinuclear_radius_um"].get()),
+                "min_iba1_positive_fraction": float(microglia["min_iba1_positive_fraction"].get()),
+            }
+        )
+        config["batch"].update(
+            {
+                "metadata_csv": self.metadata_csv.get().strip() or None,
+                "continue_on_error": bool(self.output_vars["continue_on_error"].get()),
+            }
+        )
+        config["output"].update(
+            {
+                **{
+                    key: bool(self.output_vars[key].get())
+                    for key in OUTPUT_SELECTION_DEFAULTS
+                },
+                "ring_boundary_width_px": int(
+                    self.output_vars["ring_boundary_width_px"].get()
+                ),
+                "preview_max_dimension_px": int(
+                    self.output_vars["preview_max_dimension_px"].get()
+                ),
+            }
+        )
+        info = inspect_image(
+            source,
+            pixel_size_um_x=config["input"]["pixel_size_um_x"],
+            pixel_size_um_y=config["input"]["pixel_size_um_y"],
+            image_width_um=config["input"]["image_width_um"],
+            image_height_um=config["input"]["image_height_um"],
+        )
+        return normalize_config(config, info)
+
+    def _apply_config(self, config: dict[str, Any]) -> None:
+        application = config.get("application", {})
+        if application.get("cache_directory"):
+            self.cache_root.set(str(application["cache_directory"]))
+        input_config = config.get("input", {})
+        for key, default in (
+            ("scene", 0), ("time_index", 0), ("z_projection", "max"), ("z_index", 0),
+            ("zoom", 1.0), ("pixel_size_um_x", None), ("pixel_size_um_y", None),
+            ("image_width_um", None), ("image_height_um", None),
+        ):
+            value = input_config.get(key, default)
+            self.input_vars[key].set("" if value is None else str(value))
+        for role in ROLES:
+            item = config.get("channels", {}).get(role, {})
+            variables = self.channel_vars[role]
+            variables["enabled"].set(bool(item.get("enabled", role != "dapi")))
+            variables["index"].set(str(item.get("index", ROLES.index(role))))
+            variables["alias"].set(str(item.get("alias", ROLE_LABELS[role])))
+            wavelength = item.get("wavelength_nm")
+            variables["wavelength_nm"].set("" if wavelength is None else str(wavelength))
+            variables["color"].set(str(item.get("color", DEFAULT_CONFIG["channels"][role]["color"])))
+            variables["sigma"].set(str(item.get("gaussian_sigma_px", 1.0)))
+            threshold = item.get("threshold", {})
+            for key, default in (("method", "otsu"), ("value", 0), ("scale", 1), ("percentile", 95)):
+                variables[key].set(str(threshold.get(key, default)))
+        for role in ("iba1", "cd68"):
+            item = config.get("channels", {}).get(role, {}).get("object_filter", {})
+            for key, variable in self.marker_vars[role].items():
+                value = item.get(key, DEFAULT_CONFIG["channels"][role]["object_filter"].get(key))
+                variable.set("" if value is None else value)
+        roi = config.get("tissue_roi", {})
+        for key, variable in self.roi_vars.items():
+            value = roi.get(key, DEFAULT_CONFIG["tissue_roi"].get(key))
+            variable.set("" if value is None else value)
+        plaque = config.get("plaque", {})
+        for key, variable in self.plaque_vars.items():
+            if key == "ring_edges_um":
+                value = config.get("spatial", {}).get("ring_edges_um", [0, 30])
+                variable.set(",".join(str(item) for item in value))
+            else:
+                value = plaque.get(key, DEFAULT_CONFIG["plaque"].get(key))
+                variable.set("" if value is None else value)
+        microglia = config.get("microglia_count", {})
+        for key, variable in self.microglia_vars.items():
+            value = microglia.get(key, DEFAULT_CONFIG["microglia_count"].get(key))
+            variable.set("" if value is None else value)
+        output = config.get("output", {})
+        for key, default in OUTPUT_SELECTION_DEFAULTS.items():
+            self.output_vars[key].set(output.get(key, default))
+        for key in ("ring_boundary_width_px", "preview_max_dimension_px"):
+            self.output_vars[key].set(output.get(key, DEFAULT_CONFIG["output"][key]))
+        self.output_vars["continue_on_error"].set(bool(config.get("batch", {}).get("continue_on_error", True)))
+        self.metadata_csv.set(str(config.get("batch", {}).get("metadata_csv") or ""))
+
+    def _load_session(self) -> None:
+        value = filedialog.askopenfilename(
+            title="Load parameters or session", filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")]
+        )
+        if not value:
+            return
+        try:
+            document = load_config(value)
+            config = copy.deepcopy(document.get("template_config", document))
+            raw_paths = document.get("selected_image_files") or [config.get("input", {}).get("image_path")]
+            paths = []
+            for raw in raw_paths:
+                if not raw:
+                    continue
+                path = Path(raw).expanduser().resolve()
+                if not path.is_file():
+                    raise FileNotFoundError(f"Image from session does not exist: {path}")
+                paths.append(path)
+            if paths:
+                self.image_paths = paths
+                self._refresh_files()
+                self.file_list.selection_set(0)
+            if document.get("output_root"):
+                self.output_root.set(str(document["output_root"]))
+            self._apply_config(config)
+            if paths:
+                self._inspect_selected()
+            self.status.set(f"Loaded: {value}")
+        except Exception as error:
+            messagebox.showerror("Load failed", str(error))
+
+    def _save_parameters(self) -> None:
+        try:
+            config = self._build_config()
+            value = filedialog.asksaveasfilename(
+                title="Save parameters", initialfile="cell_analysis_config.yaml", defaultextension=".yaml",
+                filetypes=[("YAML", "*.yaml")],
+            )
+            if value:
+                save_config(config, value)
+                self.status.set(f"Parameters saved: {value}")
+        except Exception as error:
+            messagebox.showerror("Save failed", str(error))
+
+    def _save_session(self) -> None:
+        try:
+            config = self._build_config()
+            output_value = self.output_root.get().strip()
+            value = filedialog.asksaveasfilename(
+                title="Save full session", initialfile="cell_analysis_session.yaml", defaultextension=".yaml",
+                filetypes=[("YAML", "*.yaml")],
+            )
+            if not value:
+                return
+            document = {
+                "format_version": 2,
+                "selected_image_files": [str(path) for path in self.image_paths],
+                "output_root": (
+                    str(Path(output_value).expanduser().resolve()) if output_value else None
+                ),
+                "template_config": config,
+                "per_file_overrides": {},
+            }
+            save_config(document, value)
+            files_path = Path(value).with_suffix(".files.txt")
+            files_path.write_text("\n".join(document["selected_image_files"]) + "\n", encoding="utf-8")
+            self.status.set(f"Session and file list saved: {value}")
+        except Exception as error:
+            messagebox.showerror("Save failed", str(error))
+
+    def _set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.preview_button.configure(state=state)
+        self.run_button.configure(state=state)
+
+    def _preview(self) -> None:
+        try:
+            source = self._selected_path()
+            config = self._build_config(source, require_runtime_paths=True)
+            config["input"]["zoom"] = float(self.input_vars["preview_zoom"].get())
+            config["input"]["output_dir"] = str(Path(self.cache_root.get()).expanduser().resolve() / "preview" / _safe_name(source))
+            for key in OUTPUT_SELECTION_DEFAULTS:
+                config["output"][key] = False
+            config["output"]["save_qc"] = True
+            if config["tissue_roi"]["mode"] == "mask_directory":
+                _resolve_mask(config, source)
+            self._set_busy(True)
+            self.status.set("Generating preview...")
+        except Exception as error:
+            messagebox.showerror("Invalid preview parameters", str(error))
+            return
+
+        def worker() -> None:
+            try:
+                result = run_analysis(
+                    config, progress=lambda message: self.messages.put(("progress", message))
+                )
+                self.messages.put(("preview_complete", result))
+            except Exception as error:
+                self.messages.put(("error", error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            config = self._build_config(require_runtime_paths=True)
+            output_root = self.output_root.get().strip()
+            if not output_root:
+                raise ValueError("Select an output folder.")
+            self._set_busy(True)
+            self.status.set("Analyzing all images...")
+        except Exception as error:
+            messagebox.showerror("Invalid parameters", str(error))
+            return
+
+        def worker() -> None:
+            try:
+                result = run_batch_analysis(
+                    self.image_paths,
+                    config,
+                    output_root,
+                    progress=lambda message: self.messages.put(("progress", message)),
+                )
+                self.messages.put(("complete", result))
+            except Exception as error:
+                self.messages.put(("error", error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_preview(self, path: str | Path) -> None:
+        preview_path = Path(path)
+        with Image.open(preview_path) as image:
+            preview = image.convert("RGB")
+            preview.thumbnail((680, 500), Image.Resampling.LANCZOS)
+        self.preview_photo = ImageTk.PhotoImage(preview)
+        self.preview_path = preview_path
+        self.preview_label.configure(image=self.preview_photo, text="")
+        self.open_preview_button.configure(state="normal")
+        self.notebook.select(self.output_tab)
+
+    def _open_preview(self) -> None:
+        if self.preview_path and self.preview_path.is_file():
+            os.startfile(self.preview_path)
+
+    def _append_log(self, message: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert(tk.END, message + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state="disabled")
+
+    def _poll_messages(self) -> None:
+        try:
+            while True:
+                kind, value = self.messages.get_nowait()
+                if kind == "progress":
+                    self.status.set(str(value))
+                    self._append_log(str(value))
+                elif kind == "preview_complete":
+                    self._set_busy(False)
+                    self.status.set("Preview complete")
+                    qc_path = value.get("files", {}).get("qc")
+                    if qc_path and Path(qc_path).is_file():
+                        try:
+                            self._show_preview(qc_path)
+                        except Exception as error:
+                            messagebox.showerror("Could not display preview", str(error))
+                elif kind == "complete":
+                    self._set_busy(False)
+                    self.status.set("Batch analysis complete")
+                    messagebox.showinfo(
+                        "Complete",
+                        f"Completed: {value['completed']}\nFailed: {value['failed']}\n\nResults: {value['output_root']}",
+                    )
+                    if self.output_vars["open_output"].get():
+                        os.startfile(value["output_root"])
+                elif kind == "error":
+                    self._set_busy(False)
+                    self.status.set("Analysis failed")
+                    messagebox.showerror("Analysis failed", str(value))
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_messages)
+
+
+def main() -> None:
+    root = tk.Tk()
+    BrainSectionGui(root)
+    root.mainloop()

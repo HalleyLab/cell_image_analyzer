@@ -1,0 +1,3 @@
+source_name,mouse_id,genotype,region,section_id,sex
+example_01.czi,WT01,WT,cortex,S01,F
+example_02.czi,KO01,PAC-cKO,cortex,S01,F
