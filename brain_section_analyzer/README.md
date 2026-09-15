@@ -55,8 +55,8 @@ Run the cells from top to bottom. The notebook panel provides:
   minimum/maximum area, circularity, solidity, and eccentricity.
 - Optional DAPI-nucleus segmentation plus local Iba1 confirmation for microglia counts
   in the tissue ROI, each plaque-distance ring, and each plaque.
-- Optional final plaque gate requiring a configurable number of DAPI+/Iba1+
-  microglia within a configurable distance from each plaque edge.
+- Optional final primary-object gate requiring a configurable number of accepted
+  cells within a configurable distance from each primary-object edge.
 - Plaque opening/closing, complete or size-limited hole filling, area, circularity, solidity, and eccentricity filters.
 - A soma-exclusion stage that uses a lower Aβ threshold to recover the complete cell outline, then combines physical diameter, filled outer circularity, filled solidity, nuclear-hole fraction, and center/shell intensity ratio.
 - Optional watershed splitting for touching plaques, with peak distance, peak height, and compactness controls.
@@ -83,7 +83,7 @@ keep a per-file override only for a documented technical reason such as a differ
 ### Why CD68 does not define plaques
 
 Plaque candidates and soma exclusion are defined from Aβ only. CD68 is never used to accept
-a plaque. The optional nearby-microglia gate is applied last using DAPI+/Iba1+ cells; disable
+a plaque. The optional nearby-cell gate is applied last using the selected cell-count channels; disable
 it for analyses intended to test microglial recruitment itself, because that gate can bias
 genotype comparisons when recruitment differs. The summary always records plaque counts
 before and after this gate. In the preview, accepted plaques have cyan boundaries,

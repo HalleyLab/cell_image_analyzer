@@ -349,6 +349,8 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         config["microglia_count"].update(
             {
                 "enabled": True,
+                "nucleus_channel": "dapi",
+                "confirmation_channel": "iba1",
                 "closing_radius_px": 0,
                 "min_nucleus_area_um2": 10,
                 "max_nucleus_area_um2": 100,
@@ -357,7 +359,7 @@ class BrainSectionAnalysisTests(unittest.TestCase):
                 "max_eccentricity": 1.0,
                 "split_touching": False,
                 "perinuclear_radius_um": 2.0,
-                "min_iba1_positive_fraction": 0.1,
+                "min_confirmation_positive_fraction": 0.1,
             }
         )
         config["plaque"].update(
@@ -404,6 +406,40 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         self.assertIn("ring_iba1_positive_area_um2", ring_table)
         self.assertIn("ring_cd68_in_iba1_fraction_of_iba1", ring_table)
 
+
+    def test_cell_count_can_use_any_selected_channel_without_confirmation(self) -> None:
+        shape = (60, 60)
+        images = {
+            "abeta": np.zeros(shape, dtype=np.uint16),
+            "iba1": np.zeros(shape, dtype=np.uint16),
+            "cd68": np.zeros(shape, dtype=np.uint16),
+        }
+        rr, cc = disk((30, 30), 5, shape=shape)
+        images["abeta"][rr, cc] = 100
+        for center in ((15, 15), (45, 45)):
+            rr, cc = disk(center, 3, shape=shape)
+            images["cd68"][rr, cc] = 100
+        config = manual_config()
+        config["microglia_count"].update(
+            {
+                "enabled": True,
+                "nucleus_channel": "cd68",
+                "confirmation_channel": None,
+                "closing_radius_px": 0,
+                "min_nucleus_area_um2": 5,
+                "max_nucleus_area_um2": 100,
+                "min_circularity": 0,
+                "min_solidity": 0,
+                "max_eccentricity": 1,
+                "split_touching": False,
+            }
+        )
+
+        products = analyze_arrays(images, config, pixel_size_um_x=1, pixel_size_um_y=1)
+
+        self.assertEqual(int(products.image_summary.iloc[0]["microglia_count_roi"]), 2)
+        self.assertEqual(set(products.microglia_cells["nucleus_channel"]), {"cd68"})
+        self.assertTrue(products.microglia_cells["confirmation_channel"].eq("").all())
 
     def test_selected_output_columns_are_exact_and_ordered(self) -> None:
         frame = pd.DataFrame({"first": [1], "second": [2], "third": [3]})

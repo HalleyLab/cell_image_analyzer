@@ -87,8 +87,8 @@ plaque:
   neuron_min_solidity: 0.60
   neuron_min_hole_fraction: 0.03
   neuron_max_center_shell_ratio: 0.95
-  # Optionally keep only plaques with enough DAPI+/Iba1+ microglia within
-  # this distance from the plaque edge.
+  # Optionally keep only primary objects with enough accepted cells within
+  # this distance from the primary-object edge.
   require_nearby_microglia: true
   nearby_microglia_radius_um: 30.0
   min_nearby_microglia_count: 1
@@ -102,10 +102,12 @@ plaque:
 spatial:
   # Every radius is cumulative and includes the plaque itself.
   # [0, 15, 30] creates plaque+0–15 µm and plaque+0–30 µm regions.
-  ring_edges_um: [0, 30]
+  ring_edges_um: []
 
 microglia_count:
   enabled: true
+  nucleus_channel: dapi
+  confirmation_channel: iba1
   opening_radius_px: 0
   closing_radius_px: 1
   fill_holes: true
@@ -117,7 +119,7 @@ microglia_count:
   split_touching: true
   min_peak_distance_px: 3
   perinuclear_radius_um: 3.0
-  min_iba1_positive_fraction: 0.15
+  min_confirmation_positive_fraction: 0.15
 
 metadata:
   mouse_id: null

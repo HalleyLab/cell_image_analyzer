@@ -203,7 +203,7 @@ def _filter_marker_components(
     role: str,
     intensity_image: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Clean and filter connected Iba1/CD68 objects using transparent rules."""
+    """Clean and filter connected channel objects using transparent rules."""
 
     cleaned = np.asarray(mask, dtype=bool)
     enabled = bool(object_filter.get("enabled", True))
@@ -408,12 +408,14 @@ def _plaque_candidate_features(
 
 
 def _segment_microglia_nuclei(
-    dapi_mask: np.ndarray,
-    iba1_mask: np.ndarray,
-    dapi_image: np.ndarray,
+    nucleus_mask: np.ndarray,
+    confirmation_mask: np.ndarray | None,
+    nucleus_image: np.ndarray,
     tissue_mask: np.ndarray,
     config: dict[str, Any],
     *,
+    nucleus_role: str,
+    confirmation_role: str | None,
     pixel_area_um2: float,
     pixel_size_um_x: float,
     pixel_size_um_y: float,
@@ -421,10 +423,10 @@ def _segment_microglia_nuclei(
     nearest_plaque_labels: np.ndarray,
     ring_edges_um: list[float],
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Identify DAPI nuclei and retain nuclei with sufficient local Iba1 signal."""
+    """Identify nuclei and optionally retain only confirmation-positive cells."""
 
     settings = config["microglia_count"]
-    cleaned = np.asarray(dapi_mask & tissue_mask, dtype=bool)
+    cleaned = np.asarray(nucleus_mask & tissue_mask, dtype=bool)
     opening = int(settings["opening_radius_px"])
     closing = int(settings["closing_radius_px"])
     if opening:
@@ -451,9 +453,7 @@ def _segment_microglia_nuclei(
             component_mask = components == component_id
             if np.any(markers[component_mask]):
                 continue
-            flat_index = int(
-                np.argmax(np.where(component_mask, nucleus_distance, -1.0))
-            )
+            flat_index = int(np.argmax(np.where(component_mask, nucleus_distance, -1.0)))
             row, column = np.unravel_index(flat_index, cleaned.shape)
             markers[row, column] = next_marker
             next_marker += 1
@@ -462,12 +462,7 @@ def _segment_microglia_nuclei(
         candidates = components
 
     minimum_area_px = max(
-        1,
-        int(
-            math.ceil(
-                float(settings["min_nucleus_area_um2"]) / pixel_area_um2
-            )
-        ),
+        1, int(math.ceil(float(settings["min_nucleus_area_um2"]) / pixel_area_um2))
     )
     maximum_area = settings.get("max_nucleus_area_um2")
     maximum_area_px = (
@@ -486,7 +481,7 @@ def _segment_microglia_nuclei(
     nucleus_id = 0
     cell_id = 0
 
-    for region in measure.regionprops(candidates, intensity_image=dapi_image):
+    for region in measure.regionprops(candidates, intensity_image=nucleus_image):
         area_um2 = float(region.area) * pixel_area_um2
         perimeter = float(region.perimeter)
         circularity = (
@@ -520,17 +515,26 @@ def _segment_microglia_nuclei(
             else local_nucleus
         )
         local_zone &= tissue_mask[crop]
-        local_iba1 = iba1_mask[crop] & local_zone
-        iba1_fraction = _safe_ratio(int(local_iba1.sum()), int(local_zone.sum()))
-        accepted_microglia = bool(
-            accepted_nucleus
-            and iba1_fraction >= float(settings["min_iba1_positive_fraction"])
-        )
+        if confirmation_mask is None:
+            confirmation_area_um2 = float("nan")
+            confirmation_fraction = float("nan")
+            accepted_microglia = accepted_nucleus
+        else:
+            local_confirmation = confirmation_mask[crop] & local_zone
+            confirmation_area_um2 = int(local_confirmation.sum()) * pixel_area_um2
+            confirmation_fraction = _safe_ratio(
+                int(local_confirmation.sum()), int(local_zone.sum())
+            )
+            accepted_microglia = bool(
+                accepted_nucleus
+                and confirmation_fraction
+                >= float(settings["min_confirmation_positive_fraction"])
+            )
         if accepted_nucleus:
             nucleus_id += 1
             nucleus_labels[candidates == int(region.label)] = nucleus_id
             if not accepted_microglia:
-                reasons.append("below_min_iba1_fraction")
+                reasons.append("below_min_confirmation_fraction")
         if accepted_microglia:
             cell_id += 1
             microglia_labels[candidates == int(region.label)] = cell_id
@@ -552,6 +556,8 @@ def _segment_microglia_nuclei(
                 "microglia_cell_id": cell_id if accepted_microglia else None,
                 "accepted_nucleus": accepted_nucleus,
                 "accepted_microglia": accepted_microglia,
+                "nucleus_channel": nucleus_role,
+                "confirmation_channel": confirmation_role or "",
                 "exclusion_reason": ";".join(reasons),
                 "centroid_y_px": float(region.centroid[0]),
                 "centroid_x_px": float(region.centroid[1]),
@@ -561,45 +567,29 @@ def _segment_microglia_nuclei(
                 "nucleus_circularity": circularity,
                 "nucleus_solidity": float(region.solidity),
                 "nucleus_eccentricity": float(region.eccentricity),
-                "dapi_mean_intensity": float(region.intensity_mean),
+                "nucleus_mean_intensity": float(region.intensity_mean),
                 "perinuclear_area_um2": int(local_zone.sum()) * pixel_area_um2,
-                "perinuclear_iba1_positive_area_um2": int(local_iba1.sum())
-                * pixel_area_um2,
-                "perinuclear_iba1_positive_fraction": iba1_fraction,
+                "perinuclear_confirmation_positive_area_um2": confirmation_area_um2,
+                "perinuclear_confirmation_positive_fraction": confirmation_fraction,
                 "nearest_plaque_id": nearest_plaque_id,
                 "distance_to_nearest_plaque_um": plaque_distance,
                 "distance_ring": ring_name,
             }
         )
 
+    columns = [
+        "candidate_nucleus_id", "nucleus_id", "microglia_cell_id",
+        "accepted_nucleus", "accepted_microglia", "nucleus_channel",
+        "confirmation_channel", "exclusion_reason", "centroid_y_px",
+        "centroid_x_px", "centroid_y_um", "centroid_x_um", "nucleus_area_um2",
+        "nucleus_circularity", "nucleus_solidity", "nucleus_eccentricity",
+        "nucleus_mean_intensity", "perinuclear_area_um2",
+        "perinuclear_confirmation_positive_area_um2",
+        "perinuclear_confirmation_positive_fraction", "nearest_plaque_id",
+        "distance_to_nearest_plaque_um", "distance_ring",
+    ]
     table = pd.DataFrame.from_records(records)
-    if table.empty:
-        table = pd.DataFrame(
-            columns=[
-                "candidate_nucleus_id",
-                "nucleus_id",
-                "microglia_cell_id",
-                "accepted_nucleus",
-                "accepted_microglia",
-                "exclusion_reason",
-                "centroid_y_px",
-                "centroid_x_px",
-                "centroid_y_um",
-                "centroid_x_um",
-                "nucleus_area_um2",
-                "nucleus_circularity",
-                "nucleus_solidity",
-                "nucleus_eccentricity",
-                "dapi_mean_intensity",
-                "perinuclear_area_um2",
-                "perinuclear_iba1_positive_area_um2",
-                "perinuclear_iba1_positive_fraction",
-                "nearest_plaque_id",
-                "distance_to_nearest_plaque_um",
-                "distance_ring",
-            ]
-        )
-    return nucleus_labels, microglia_labels, table
+    return nucleus_labels, microglia_labels, table if not table.empty else pd.DataFrame(columns=columns)
 
 
 def _is_neuron_like_candidate(features: dict[str, Any], plaque_config: dict[str, Any]) -> bool:
@@ -1079,12 +1069,11 @@ def analyze_arrays(
     tissue = _tissue_mask(config, shape)
     raw_images, positive_masks, thresholds = _threshold_channels(images, config, tissue)
 
-    # Iba1/CD68 are filtered independently after intensity thresholding. These
-    # masks feed marker-area and overlap measurements, but neither marker is
-    # used to decide which Aβ candidates are plaques.
+    # Every enabled channel is filtered independently after thresholding.
+    # Channel 1 then receives its additional primary-object segmentation rules.
     marker_labels: dict[str, np.ndarray] = {}
     marker_tables: list[pd.DataFrame] = []
-    for role in ("iba1", "cd68"):
+    for role in (role for role in ("abeta", "iba1", "cd68", "dapi") if role in positive_masks):
         filtered_mask, labels, table = _filter_marker_components(
             positive_masks[role],
             config["channels"][role].get("object_filter", {}),
@@ -1137,14 +1126,21 @@ def analyze_arrays(
         ]
     )
     if microglia_enabled:
-        if "dapi" not in positive_masks:
-            raise ValueError("Channel 4 is required when cell counting is enabled.")
+        settings = config["microglia_count"]
+        nucleus_role = settings.get("nucleus_channel")
+        confirmation_role = settings.get("confirmation_channel")
+        if nucleus_role not in marker_labels:
+            raise ValueError("The selected nucleus channel is not enabled.")
+        if confirmation_role is not None and confirmation_role not in marker_labels:
+            raise ValueError("The selected confirmation channel is not enabled.")
         nucleus_labels, microglia_labels, microglia_cells = _segment_microglia_nuclei(
-            positive_masks["dapi"],
-            positive_masks["iba1"],
-            raw_images["dapi"],
+            marker_labels[nucleus_role] > 0,
+            marker_labels[confirmation_role] > 0 if confirmation_role else None,
+            raw_images[nucleus_role],
             tissue,
             config,
+            nucleus_role=nucleus_role,
+            confirmation_role=confirmation_role,
             pixel_area_um2=pixel_area_um2,
             pixel_size_um_x=pixel_size_um_x,
             pixel_size_um_y=pixel_size_um_y,
@@ -1257,7 +1253,7 @@ def analyze_arrays(
         ),
         "microglia_count_available": microglia_enabled,
     }
-    for role in ("iba1", "cd68"):
+    for role in marker_labels:
         role_table = marker_component_qc.loc[marker_component_qc["marker"] == role]
         accepted = role_table["accepted"].astype(bool)
         summary[f"{role}_component_candidate_count"] = int(len(role_table))
@@ -1477,6 +1473,7 @@ def _save_qc(
     max_dimension: int,
     channel_colors: dict[str, tuple[float, float, float]],
     channel_names: dict[str, str],
+    cell_count_config: dict[str, Any],
     processing_dir: Path | None = None,
     save_raw_channels: bool = True,
     save_composite: bool = True,
@@ -1488,59 +1485,40 @@ def _save_qc(
     stride = max(1, int(math.ceil(max(shape) / max_dimension)))
     sl = (slice(None, None, stride), slice(None, None, stride))
     scaled = {role: _display_scale(image)[sl] for role, image in raw_images.items()}
-    tinted = {
-        role: _tint(image, channel_colors[role])
-        for role, image in scaled.items()
-    }
+    tinted = {role: _tint(image, channel_colors[role]) for role, image in scaled.items()}
     composite = np.clip(
         sum((tinted[role] for role in tinted), np.zeros_like(next(iter(tinted.values())))),
         0.0,
         1.0,
     )
     labels = products.plaque_labels[sl]
-    iba1_labels = products.marker_labels["iba1"][sl]
-    cd68_labels = products.marker_labels["cd68"][sl]
     neuron_like = products.neuron_like_mask[sl]
     no_microglia = products.microglia_absent_plaque_mask[sl]
     tissue = products.tissue_mask[sl]
     plaque_boundaries = segmentation.find_boundaries(labels, mode="outer")
-    iba1_boundaries = segmentation.find_boundaries(iba1_labels, mode="outer")
-    cd68_boundaries = segmentation.find_boundaries(cd68_labels, mode="outer")
     neuron_boundaries = segmentation.find_boundaries(neuron_like, mode="outer")
-    no_microglia_boundaries = segmentation.find_boundaries(
-        no_microglia, mode="outer"
-    )
+    no_microglia_boundaries = segmentation.find_boundaries(no_microglia, mode="outer")
     tissue_boundaries = segmentation.find_boundaries(tissue, mode="inner")
-    ring_union = np.zeros(labels.shape, dtype=bool)
-    for mask in products.ring_masks.values():
-        ring_union |= mask[sl]
-    ring_boundaries = segmentation.find_boundaries(ring_union, mode="outer")
     abeta_overlay = _overlay(tinted["abeta"], plaque_boundaries, (0.0, 1.0, 1.0))
     abeta_overlay = _overlay(abeta_overlay, neuron_boundaries, (1.0, 0.0, 1.0))
-    abeta_overlay = _overlay(
-        abeta_overlay, no_microglia_boundaries, (1.0, 0.5, 0.0)
-    )
-    iba1_overlay = _overlay(tinted["iba1"], iba1_boundaries, (0.0, 1.0, 0.0))
-    cd68_overlay = _overlay(tinted["cd68"], cd68_boundaries, (1.0, 1.0, 0.0))
-    ring_overlay = _overlay(
-        composite,
-        ring_boundaries,
-        (1.0, 1.0, 0.0),
-        width_px=ring_boundary_width_px,
-    )
+    abeta_overlay = _overlay(abeta_overlay, no_microglia_boundaries, (1.0, 0.5, 0.0))
+    object_boundary_colors = {
+        "abeta": (0.0, 1.0, 1.0),
+        "iba1": (0.0, 1.0, 0.0),
+        "cd68": (1.0, 1.0, 0.0),
+        "dapi": (1.0, 1.0, 1.0),
+    }
+    object_overlays = {
+        role: _overlay(
+            tinted[role],
+            segmentation.find_boundaries(products.marker_labels[role][sl], mode="outer"),
+            object_boundary_colors[role],
+        )
+        for role in tinted
+    }
     tissue_overlay = composite.copy()
     tissue_overlay[~tissue] *= 0.15
     tissue_overlay = _overlay(tissue_overlay, tissue_boundaries, (1.0, 0.0, 1.0))
-    dapi_overlay = None
-    if "dapi" in tinted:
-        nucleus_boundary = segmentation.find_boundaries(
-            products.nucleus_labels[sl], mode="outer"
-        )
-        microglia_boundary = segmentation.find_boundaries(
-            products.microglia_labels[sl], mode="outer"
-        )
-        dapi_overlay = _overlay(tinted["dapi"], nucleus_boundary, (1.0, 1.0, 1.0))
-        dapi_overlay = _overlay(dapi_overlay, microglia_boundary, (1.0, 1.0, 0.0))
 
     panels: list[tuple[str, str, np.ndarray]] = [
         ("05_composite", "Composite: selected channel colors", composite),
@@ -1549,29 +1527,61 @@ def _save_qc(
             f"{channel_names['abeta']}: primary objects cyan; excluded objects magenta; no-nearby-cell orange",
             abeta_overlay,
         ),
-        ("07_channel_2_objects", f"{channel_names['iba1']}: accepted-object boundaries green", iba1_overlay),
-        ("08_channel_3_objects", f"{channel_names['cd68']}: accepted-object boundaries yellow", cd68_overlay),
-        ("10_primary_object_distance_rings", "Primary-object distance-ring boundaries yellow", ring_overlay),
-        ("11_tissue_roi", "Tissue ROI boundary magenta", tissue_overlay),
     ]
-    if dapi_overlay is not None:
-        panels.insert(
-            4,
-            (
-                "09_channel_4_cells",
-                f"{channel_names['dapi']} nuclei white; {channel_names['iba1']}-confirmed cells yellow",
-                dapi_overlay,
-            ),
+    for index, role in enumerate(("abeta", "iba1", "cd68", "dapi"), start=1):
+        if role in object_overlays:
+            panels.append(
+                (
+                    f"07_channel_{index}_objects",
+                    f"{channel_names[role]}: accepted object-filter boundaries",
+                    object_overlays[role],
+                )
+            )
+
+    nucleus_role = cell_count_config.get("nucleus_channel")
+    confirmation_role = cell_count_config.get("confirmation_channel")
+    if bool(cell_count_config.get("enabled")) and nucleus_role in tinted:
+        nucleus_boundary = segmentation.find_boundaries(products.nucleus_labels[sl], mode="outer")
+        cell_boundary = segmentation.find_boundaries(products.microglia_labels[sl], mode="outer")
+        cell_overlay = _overlay(tinted[nucleus_role], nucleus_boundary, (1.0, 1.0, 1.0))
+        cell_overlay = _overlay(cell_overlay, cell_boundary, (1.0, 1.0, 0.0))
+        confirmation_text = (
+            f"; {channel_names[confirmation_role]}-confirmed cells yellow"
+            if confirmation_role
+            else "; accepted cells yellow"
         )
+        panels.append(
+            (
+                "09_cell_counting",
+                f"{channel_names[nucleus_role]} nuclei white{confirmation_text}",
+                cell_overlay,
+            )
+        )
+    if products.ring_masks:
+        ring_union = np.zeros(labels.shape, dtype=bool)
+        for mask in products.ring_masks.values():
+            ring_union |= mask[sl]
+        ring_overlay = _overlay(
+            composite,
+            segmentation.find_boundaries(ring_union, mode="outer"),
+            (1.0, 1.0, 0.0),
+            width_px=ring_boundary_width_px,
+        )
+        panels.append(
+            ("10_primary_object_distance_rings", "Primary-object distance-ring boundaries yellow", ring_overlay)
+        )
+    panels.append(("11_tissue_roi", "Tissue ROI boundary magenta", tissue_overlay))
 
     saved: dict[str, str] = {}
     if path is not None:
-        figure, axes = plt.subplots(2, 4, figsize=(18, 9))
+        columns = 4
+        rows = int(math.ceil(len(panels) / columns))
+        figure, axes = plt.subplots(rows, columns, figsize=(18, 4.5 * rows), squeeze=False)
         for axis, (_, title, panel) in zip(axes.ravel(), panels):
             axis.imshow(panel)
             axis.set_title(title, fontsize=10)
             axis.axis("off")
-        for axis in axes.ravel()[len(panels) :]:
+        for axis in axes.ravel()[len(panels):]:
             axis.axis("off")
         figure.tight_layout()
         figure.savefig(path, dpi=160, bbox_inches="tight")
@@ -1598,33 +1608,26 @@ def _save_qc(
         if save_mask_images:
             mask_images = {
                 "channel_1_primary_object_mask": _tint(
-                    products.positive_masks["abeta"][sl].astype(float),
-                    channel_colors["abeta"],
+                    products.positive_masks["abeta"][sl].astype(float), channel_colors["abeta"]
                 ),
                 "channel_1_excluded_object_mask": _tint(
                     products.neuron_like_mask[sl].astype(float), (1.0, 0.0, 1.0)
                 ),
                 "channel_1_no_nearby_cell_excluded": _tint(
-                    products.microglia_absent_plaque_mask[sl].astype(float),
-                    (1.0, 0.5, 0.0),
-                ),
-                "channel_2_positive_mask": _tint(
-                    products.positive_masks["iba1"][sl].astype(float),
-                    channel_colors["iba1"],
-                ),
-                "channel_3_positive_mask": _tint(
-                    products.positive_masks["cd68"][sl].astype(float),
-                    channel_colors["cd68"],
+                    products.microglia_absent_plaque_mask[sl].astype(float), (1.0, 0.5, 0.0)
                 ),
             }
-            if "dapi" in channel_colors:
-                mask_images["channel_4_nucleus_mask"] = _tint(
-                    (products.nucleus_labels[sl] > 0).astype(float),
-                    channel_colors["dapi"],
+            for index, role in enumerate(("abeta", "iba1", "cd68", "dapi"), start=1):
+                if role in products.marker_labels:
+                    mask_images[f"channel_{index}_object_filter_mask"] = _tint(
+                        (products.marker_labels[role][sl] > 0).astype(float), channel_colors[role]
+                    )
+            if bool(cell_count_config.get("enabled")) and nucleus_role in channel_colors:
+                mask_images["nucleus_mask"] = _tint(
+                    (products.nucleus_labels[sl] > 0).astype(float), channel_colors[nucleus_role]
                 )
                 mask_images["cell_mask"] = _tint(
-                    (products.microglia_labels[sl] > 0).astype(float),
-                    (1.0, 1.0, 0.0),
+                    (products.microglia_labels[sl] > 0).astype(float), (1.0, 1.0, 0.0)
                 )
             for name, image in mask_images.items():
                 filename = processing_dir / f"mask_{name}.png"
@@ -1636,6 +1639,7 @@ def _save_qc(
                 saved[f"processing_mask_{name}"] = str(filename)
         saved["processing_images_dir"] = str(processing_dir)
     return saved
+
 
 def _channel_colors(
     info: Any,
@@ -1784,22 +1788,20 @@ def _write_outputs(
         tifffile.imwrite(
             marker_labels_path,
             np.stack(
-                [
-                    products.marker_labels[role].astype(np.uint32)
-                    for role in ("iba1", "cd68")
-                ]
+                [products.marker_labels[role].astype(np.uint32) for role in products.marker_labels]
             ),
             metadata={
                 "axes": "CYX",
                 "channel_names": [
-                    config["channels"][role]["alias"] for role in ("iba1", "cd68")
+                    config["channels"][role]["alias"] for role in products.marker_labels
                 ],
             },
             compression="zlib",
         )
         paths["marker_component_labels"] = str(marker_labels_path)
-    if bool(output.get("save_cell_labels", True)) and "dapi" in products.positive_masks:
-        nucleus_labels_path = output_dir / "channel_4_nucleus_labels.tiff"
+    nucleus_role = config["microglia_count"].get("nucleus_channel")
+    if bool(output.get("save_cell_labels", True)) and nucleus_role in products.positive_masks:
+        nucleus_labels_path = output_dir / "nucleus_labels.tiff"
         cell_labels_path = output_dir / "cell_labels.tiff"
         tifffile.imwrite(
             nucleus_labels_path,
@@ -1813,8 +1815,8 @@ def _write_outputs(
         )
         paths.update(
             {
-                "dapi_nucleus_labels": str(nucleus_labels_path),
-                "microglia_cell_labels": str(cell_labels_path),
+                "nucleus_labels": str(nucleus_labels_path),
+                "cell_labels": str(cell_labels_path),
             }
         )
     if bool(output.get("save_positive_masks", True)):
@@ -1860,6 +1862,7 @@ def _write_outputs(
                 int(output.get("preview_max_dimension_px", 2200)),
                 channel_colors,
                 channel_names,
+                config["microglia_count"],
                 output_dir / "processing_images" if save_processing else None,
                 **processing_flags,
                 ring_boundary_width_px=int(output.get("ring_boundary_width_px", 1)),

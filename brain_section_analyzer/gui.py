@@ -13,6 +13,7 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Any
 
 from PIL import Image, ImageTk
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from cell_analyzer.image_io import (
     CACHE_DIRECTORY,
@@ -35,6 +36,8 @@ from .config import (
 
 ROLES = ("abeta", "iba1", "cd68", "dapi")
 ROLE_LABELS = dict(zip(ROLES, ("Channel 1", "Channel 2", "Channel 3", "Channel 4")))
+ROLE_BY_LABEL = {label: role for role, label in ROLE_LABELS.items()}
+CELL_CHANNEL_CHOICES = ("", *ROLE_LABELS.values())
 THRESHOLD_METHODS = ("manual", "otsu", "yen", "triangle", "percentile")
 TABLE_FILE_OUTPUT_KEYS = {
     "save_excel",
@@ -130,6 +133,8 @@ class BrainSectionGui:
         scrollbar = ttk.Scrollbar(files_frame, orient="vertical", command=self.file_list.yview)
         scrollbar.grid(row=0, column=1, rowspan=5, sticky="ns")
         self.file_list.configure(yscrollcommand=scrollbar.set)
+        self.file_list.drop_target_register(DND_FILES)
+        self.file_list.dnd_bind("<<Drop>>", self._drop_images)
         ttk.Button(files_frame, text="Add images", command=self._add_images).grid(row=0, column=2, sticky="ew", padx=6)
         ttk.Button(files_frame, text="Inspect selected image", command=self._inspect_selected).grid(row=1, column=2, sticky="ew", padx=6)
         ttk.Button(files_frame, text="Remove selected", command=self._remove_images).grid(row=2, column=2, sticky="ew", padx=6)
@@ -299,22 +304,25 @@ class BrainSectionGui:
             ttk.Entry(parent, textvariable=variables["percentile"], width=8).grid(row=row, column=10, padx=3)
 
         ttk.Label(parent, text="These channel settings are applied to every selected file.").grid(row=5, column=0, columnspan=11, sticky="w", padx=4, pady=(4, 0))
-        for column, role in enumerate(("iba1", "cd68")):
+        filter_tabs = ttk.Notebook(parent)
+        filter_tabs.grid(row=6, column=0, columnspan=11, sticky="nsew", padx=5, pady=12)
+        for role in ROLES:
+            defaults = DEFAULT_CONFIG["channels"][role]["object_filter"]
             variables = {
-                "enabled": tk.BooleanVar(value=True),
-                "opening_radius_px": tk.StringVar(value="0"),
-                "closing_radius_px": tk.StringVar(value="0"),
-                "fill_holes": tk.BooleanVar(value=False),
-                "max_hole_area_um2": tk.StringVar(value="0"),
-                "min_area_um2": tk.StringVar(value="0"),
+                "enabled": tk.BooleanVar(value=defaults["enabled"]),
+                "opening_radius_px": tk.StringVar(value=str(defaults["opening_radius_px"])),
+                "closing_radius_px": tk.StringVar(value=str(defaults["closing_radius_px"])),
+                "fill_holes": tk.BooleanVar(value=defaults["fill_holes"]),
+                "max_hole_area_um2": tk.StringVar(value=str(defaults["max_hole_area_um2"])),
+                "min_area_um2": tk.StringVar(value=str(defaults["min_area_um2"])),
                 "max_area_um2": tk.StringVar(),
-                "min_circularity": tk.StringVar(value="0"),
-                "min_solidity": tk.StringVar(value="0"),
-                "max_eccentricity": tk.StringVar(value="1"),
+                "min_circularity": tk.StringVar(value=str(defaults["min_circularity"])),
+                "min_solidity": tk.StringVar(value=str(defaults["min_solidity"])),
+                "max_eccentricity": tk.StringVar(value=str(defaults["max_eccentricity"])),
             }
             self.marker_vars[role] = variables
-            frame = ttk.LabelFrame(parent, text=f"{ROLE_LABELS[role]} object filter", padding=8)
-            frame.grid(row=6, column=column * 6, columnspan=5, sticky="nsew", padx=5, pady=12)
+            frame = ttk.Frame(filter_tabs, padding=8)
+            filter_tabs.add(frame, text=f"{ROLE_LABELS[role]} object filter")
             self._entry_grid(
                 frame,
                 variables,
@@ -360,7 +368,7 @@ class BrainSectionGui:
             "watershed_compactness": tk.StringVar(value="0"),
             "exclude_boundary_plaques_from_table": tk.BooleanVar(value=True),
             "boundary_margin_um": tk.StringVar(value="0"),
-            "ring_edges_um": tk.StringVar(value="0,30"),
+            "ring_edges_um": tk.StringVar(),
         }
         frames = [
             ("Primary-object morphology", [
@@ -406,6 +414,8 @@ class BrainSectionGui:
     def _build_microglia_tab(self, parent: ttk.Frame) -> None:
         self.microglia_vars = {
             "enabled": tk.BooleanVar(value=False),
+            "nucleus_channel": tk.StringVar(),
+            "confirmation_channel": tk.StringVar(),
             "opening_radius_px": tk.StringVar(value="0"),
             "closing_radius_px": tk.StringVar(value="1"),
             "fill_holes": tk.BooleanVar(value=True),
@@ -417,15 +427,17 @@ class BrainSectionGui:
             "split_touching": tk.BooleanVar(value=True),
             "min_peak_distance_px": tk.StringVar(value="3"),
             "perinuclear_radius_um": tk.StringVar(value="3"),
-            "min_iba1_positive_fraction": tk.StringVar(value="0.15"),
+            "min_confirmation_positive_fraction": tk.StringVar(value="0.15"),
         }
-        frame = ttk.LabelFrame(parent, text="Channel 4 nuclei + perinuclear Channel 2 cell detection", padding=8)
+        frame = ttk.LabelFrame(parent, text="Cell detection", padding=8)
         frame.grid(row=0, column=0, sticky="nsew")
         self._entry_grid(
             frame,
             self.microglia_vars,
             [
                 ("Enable cell counting", "enabled", None),
+                ("Nucleus channel", "nucleus_channel", CELL_CHANNEL_CHOICES),
+                ("Confirmation channel (optional)", "confirmation_channel", CELL_CHANNEL_CHOICES),
                 ("Nucleus open px", "opening_radius_px", None),
                 ("Nucleus close px", "closing_radius_px", None),
                 ("Fill nucleus holes", "fill_holes", None),
@@ -437,12 +449,12 @@ class BrainSectionGui:
                 ("Split touching nuclei", "split_touching", None),
                 ("Minimum nucleus peak distance px", "min_peak_distance_px", None),
                 ("Perinuclear radius µm", "perinuclear_radius_um", None),
-                ("Minimum perinuclear Channel 2-positive fraction", "min_iba1_positive_fraction", None),
+                ("Minimum confirmation-positive fraction", "min_confirmation_positive_fraction", None),
             ],
         )
         ttk.Label(
             parent,
-            text="Channel 4 must also be enabled. Cells inside primary objects are included in cumulative ranges.",
+            text="Choose any enabled nucleus channel. Leave confirmation blank to count by nucleus morphology only.",
             wraplength=700,
         ).grid(row=1, column=0, sticky="w", padx=5, pady=10)
 
@@ -710,6 +722,23 @@ class BrainSectionGui:
         selected = self.file_list.curselection()
         return self.image_paths[selected[0] if selected else 0]
 
+    def _add_image_paths(self, values: tuple[str, ...] | list[str]) -> None:
+        existing = {str(path).casefold() for path in self.image_paths}
+        for value in values:
+            path = Path(value).expanduser().resolve()
+            key = str(path).casefold()
+            if path.is_file() and path.suffix.casefold() in SUPPORTED_IMAGE_SUFFIXES and key not in existing:
+                self.image_paths.append(path)
+                existing.add(key)
+        self._refresh_files()
+        if self.image_paths and self.info is None:
+            self.file_list.selection_clear(0, tk.END)
+            self.file_list.selection_set(0)
+
+    def _drop_images(self, event: Any) -> str:
+        self._add_image_paths(list(self.root.tk.splitlist(event.data)))
+        return "break"
+
     def _add_images(self) -> None:
         values = filedialog.askopenfilenames(
             title="Select microscopy images",
@@ -723,18 +752,7 @@ class BrainSectionGui:
                 ("All files", "*.*"),
             ],
         )
-        existing = {str(path).casefold() for path in self.image_paths}
-        for value in values:
-            path = Path(value).resolve()
-            if path.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
-                continue
-            if str(path).casefold() not in existing:
-                self.image_paths.append(path)
-                existing.add(str(path).casefold())
-        self._refresh_files()
-        if self.image_paths and self.info is None:
-            self.file_list.selection_clear(0, tk.END)
-            self.file_list.selection_set(0)
+        self._add_image_paths(list(values))
 
     def _remove_images(self) -> None:
         selected = set(self.file_list.curselection())
@@ -868,7 +886,7 @@ class BrainSectionGui:
                 }
             )
         config["channels"]["dapi"]["enabled"] = bool(self.channel_vars["dapi"]["enabled"].get())
-        for role in ("iba1", "cd68"):
+        for role in ROLES:
             variables = self.marker_vars[role]
             config["channels"][role]["object_filter"].update(
                 {
@@ -930,6 +948,8 @@ class BrainSectionGui:
         config["microglia_count"].update(
             {
                 "enabled": bool(microglia["enabled"].get()),
+                "nucleus_channel": ROLE_BY_LABEL.get(microglia["nucleus_channel"].get()),
+                "confirmation_channel": ROLE_BY_LABEL.get(microglia["confirmation_channel"].get()),
                 "opening_radius_px": int(microglia["opening_radius_px"].get()),
                 "closing_radius_px": int(microglia["closing_radius_px"].get()),
                 "fill_holes": bool(microglia["fill_holes"].get()),
@@ -941,7 +961,9 @@ class BrainSectionGui:
                 "split_touching": bool(microglia["split_touching"].get()),
                 "min_peak_distance_px": int(microglia["min_peak_distance_px"].get()),
                 "perinuclear_radius_um": float(microglia["perinuclear_radius_um"].get()),
-                "min_iba1_positive_fraction": float(microglia["min_iba1_positive_fraction"].get()),
+                "min_confirmation_positive_fraction": float(
+                    microglia["min_confirmation_positive_fraction"].get()
+                ),
             }
         )
         config["batch"].update(
@@ -1003,7 +1025,7 @@ class BrainSectionGui:
             threshold = item.get("threshold", {})
             for key, default in (("method", "otsu"), ("value", 0), ("scale", 1), ("percentile", 95)):
                 variables[key].set(str(threshold.get(key, default)))
-        for role in ("iba1", "cd68"):
+        for role in ROLES:
             item = config.get("channels", {}).get(role, {}).get("object_filter", {})
             for key, variable in self.marker_vars[role].items():
                 value = item.get(key, DEFAULT_CONFIG["channels"][role]["object_filter"].get(key))
@@ -1015,7 +1037,7 @@ class BrainSectionGui:
         plaque = config.get("plaque", {})
         for key, variable in self.plaque_vars.items():
             if key == "ring_edges_um":
-                value = config.get("spatial", {}).get("ring_edges_um", [0, 30])
+                value = config.get("spatial", {}).get("ring_edges_um", [])
                 variable.set(",".join(str(item) for item in value))
             else:
                 value = plaque.get(key, DEFAULT_CONFIG["plaque"].get(key))
@@ -1023,7 +1045,10 @@ class BrainSectionGui:
         microglia = config.get("microglia_count", {})
         for key, variable in self.microglia_vars.items():
             value = microglia.get(key, DEFAULT_CONFIG["microglia_count"].get(key))
-            variable.set("" if value is None else value)
+            if key in {"nucleus_channel", "confirmation_channel"}:
+                variable.set(ROLE_LABELS.get(value, ""))
+            else:
+                variable.set("" if value is None else value)
         output = config.get("output", {})
         for key, default in OUTPUT_SELECTION_DEFAULTS.items():
             self.output_vars[key].set(output.get(key, default))
@@ -1222,6 +1247,6 @@ class BrainSectionGui:
 
 
 def main() -> None:
-    root = tk.Tk()
+    root = TkinterDnD.Tk()
     BrainSectionGui(root)
     root.mainloop()

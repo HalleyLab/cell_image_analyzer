@@ -13,3 +13,4 @@ roifile>=2024.1
 scikit-image>=0.22
 scipy>=1.11
 tifffile>=2024.1
+tkinterdnd2>=0.4.3

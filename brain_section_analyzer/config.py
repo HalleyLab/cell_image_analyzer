@@ -93,6 +93,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "color": "#00FF33",
             "gaussian_sigma_px": 1.0,
             "threshold": copy.deepcopy(DEFAULT_THRESHOLD),
+            "object_filter": copy.deepcopy(DEFAULT_OBJECT_FILTER),
         },
         "iba1": {
             "index": 1,
@@ -120,6 +121,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "color": "#0033FF",
             "gaussian_sigma_px": 1.0,
             "threshold": copy.deepcopy(DEFAULT_THRESHOLD),
+            "object_filter": copy.deepcopy(DEFAULT_OBJECT_FILTER),
         },
     },
     "tissue_roi": {
@@ -158,10 +160,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "boundary_margin_um": 0.0,
     },
     "spatial": {
-        "ring_edges_um": [0.0, 30.0],
+        "ring_edges_um": [],
     },
     "microglia_count": {
         "enabled": False,
+        "nucleus_channel": None,
+        "confirmation_channel": None,
         "opening_radius_px": 0,
         "closing_radius_px": 1,
         "fill_holes": True,
@@ -173,7 +177,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "split_touching": True,
         "min_peak_distance_px": 3,
         "perinuclear_radius_um": 3.0,
-        "min_iba1_positive_fraction": 0.15,
+        "min_confirmation_positive_fraction": 0.15,
     },
     "metadata": {
         "mouse_id": None,
@@ -384,7 +388,7 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
             raise ValueError(f"{item['alias']} threshold scale must be greater than zero.")
         if not 0 <= threshold["percentile"] <= 100:
             raise ValueError(f"{item['alias']} threshold percentile must be between 0 and 100.")
-        if role in {"iba1", "cd68"}:
+        if role in roles:
             object_filter = item["object_filter"]
             object_filter["enabled"] = bool(object_filter.get("enabled", True))
             object_filter["opening_radius_px"] = max(
@@ -557,14 +561,34 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     )
 
     edges = [float(value) for value in merged["spatial"].get("ring_edges_um", [])]
-    if len(edges) < 2 or edges[0] != 0 or any(b <= a for a, b in zip(edges, edges[1:])):
+    if edges and (
+        len(edges) < 2
+        or edges[0] != 0
+        or any(b <= a for a, b in zip(edges, edges[1:]))
+    ):
         raise ValueError("spatial.ring_edges_um must start at 0 and increase, e.g. [0, 30].")
     merged["spatial"]["ring_edges_um"] = edges
 
     microglia = merged["microglia_count"]
+    raw_microglia = config.get("microglia_count", {})
+    if (
+        raw_microglia.get("nucleus_channel") in {None, ""}
+        and "min_iba1_positive_fraction" in raw_microglia
+    ):
+        # Preserve old sessions and the legacy notebook while new GUI sessions stay unassigned.
+        microglia["nucleus_channel"] = "dapi"
+        microglia["confirmation_channel"] = "iba1"
+        microglia["min_confirmation_positive_fraction"] = raw_microglia[
+            "min_iba1_positive_fraction"
+        ]
     microglia["enabled"] = bool(microglia.get("enabled", False))
-    if microglia["enabled"] and not dapi_enabled:
-        raise ValueError("Cell counting requires Channel 4 to be enabled.")
+    for key in ("nucleus_channel", "confirmation_channel"):
+        value = microglia.get(key)
+        microglia[key] = None if value in {None, ""} else str(value)
+        if microglia[key] is not None and microglia[key] not in roles:
+            raise ValueError(f"microglia_count.{key} must select an enabled channel.")
+    if microglia["enabled"] and microglia["nucleus_channel"] is None:
+        raise ValueError("Select a nucleus channel for cell counting.")
     for key, default in (
         ("opening_radius_px", 0),
         ("closing_radius_px", 1),
@@ -593,7 +617,7 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
         ("min_circularity", 0.20),
         ("min_solidity", 0.70),
         ("max_eccentricity", 0.98),
-        ("min_iba1_positive_fraction", 0.15),
+        ("min_confirmation_positive_fraction", 0.15),
     ):
         microglia[key] = float(microglia.get(key, default))
         if not 0 <= microglia[key] <= 1:
