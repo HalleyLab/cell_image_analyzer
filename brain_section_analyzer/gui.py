@@ -39,6 +39,13 @@ ROLE_LABELS = dict(zip(ROLES, ("Channel 1", "Channel 2", "Channel 3", "Channel 4
 ROLE_BY_LABEL = {label: role for role, label in ROLE_LABELS.items()}
 CELL_CHANNEL_CHOICES = ("", *ROLE_LABELS.values())
 THRESHOLD_METHODS = ("manual", "otsu", "yen", "triangle", "percentile")
+PREVIEW_IMAGE_OUTPUT_KEYS = (
+    "save_qc",
+    "save_raw_channel_images",
+    "save_composite_image",
+    "save_segmentation_images",
+    "save_mask_images",
+)
 TABLE_FILE_OUTPUT_KEYS = {
     "save_excel",
     "save_image_summary_csv",
@@ -80,6 +87,16 @@ def _safe_name(path: Path) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", path.stem).strip(" ._") or "image"
 
 
+def _preview_image_choices(files: dict[str, Any]) -> dict[str, Path]:
+    choices: dict[str, Path] = {}
+    for key, value in files.items():
+        path = Path(value)
+        if path.is_file() and path.suffix.casefold() in {".png", ".tif", ".tiff"}:
+            label = "Overview QC" if key == "qc" else key.removeprefix("processing_").replace("_", " ").title()
+            choices[label] = path
+    return choices
+
+
 class BrainSectionGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -92,6 +109,7 @@ class BrainSectionGui:
         self.marker_vars: dict[str, dict[str, tk.Variable]] = {}
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_path: Path | None = None
+        self.preview_files: dict[str, Path] = {}
         self.available_output_columns: dict[str, list[str]] = {}
         self.selected_output_columns: dict[str, list[str]] = {}
         self._build()
@@ -149,7 +167,7 @@ class BrainSectionGui:
         ttk.Label(output_frame, text="Output folder").grid(row=0, column=0, sticky="w")
         ttk.Entry(output_frame, textvariable=self.output_root).grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(output_frame, text="Browse", command=self._browse_output).grid(row=0, column=2)
-        ttk.Label(output_frame, text="Application cache folder").grid(row=1, column=0, sticky="w")
+        ttk.Label(output_frame, text="Cache folder").grid(row=1, column=0, sticky="w")
         ttk.Entry(output_frame, textvariable=self.cache_root).grid(row=1, column=1, sticky="ew", padx=4)
         ttk.Button(output_frame, text="Browse", command=self._browse_cache).grid(row=1, column=2)
         ttk.Label(output_frame, text="Sample metadata CSV (optional)").grid(row=2, column=0, sticky="w")
@@ -184,9 +202,15 @@ class BrainSectionGui:
 
         controls = ttk.Frame(outer)
         controls.pack(fill="x", pady=(8, 0))
-        ttk.Button(controls, text="Load parameters/session", command=self._load_session).pack(side="left", padx=3)
-        ttk.Button(controls, text="Save parameters YAML", command=self._save_parameters).pack(side="left", padx=3)
-        ttk.Button(controls, text="Save full session", command=self._save_session).pack(side="left", padx=3)
+        ttk.Button(
+            controls, text="Load parameters/session", width=25, command=self._load_session
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            controls, text="Save parameters", width=20, command=self._save_parameters
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            controls, text="Save session", width=18, command=self._save_session
+        ).pack(side="left", padx=3)
         self.status = tk.StringVar(value="Ready")
         ttk.Label(controls, textvariable=self.status).pack(side="left", padx=12)
 
@@ -507,13 +531,18 @@ class BrainSectionGui:
             ("Primary-object label TIFF", "save_primary_object_labels"),
             ("Excluded-object mask TIFFs", "save_excluded_object_masks"),
             ("Channel-object label TIFF", "save_channel_object_labels"),
-            ("Channel 4 / cell label TIFFs", "save_cell_labels"),
+            ("Nucleus / cell label TIFFs", "save_cell_labels"),
             ("Positive-mask TIFF", "save_positive_masks"),
         )
         for row, (label, key) in enumerate(image_outputs):
             ttk.Checkbutton(image_frame, text=label, variable=self.output_vars[key]).grid(
                 row=row, column=0, sticky="w", pady=2
             )
+        ttk.Label(
+            image_frame,
+            text="The first five choices also control which preview images are generated.",
+            wraplength=230,
+        ).grid(row=len(image_outputs), column=0, sticky="w", pady=(8, 0))
 
         preview_frame = ttk.LabelFrame(parent, text="Processed preview", padding=8)
         preview_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
@@ -525,13 +554,35 @@ class BrainSectionGui:
             anchor="center",
         )
         self.preview_label.grid(row=0, column=0, sticky="nsew")
+        preview_toolbar = ttk.Frame(preview_frame)
+        preview_toolbar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(preview_toolbar, text="Displayed result").pack(side="left")
+        self.preview_choice = tk.StringVar()
+        self.preview_selector = ttk.Combobox(
+            preview_toolbar,
+            textvariable=self.preview_choice,
+            state="disabled",
+            width=32,
+        )
+        self.preview_selector.pack(side="left", padx=5)
+        self.preview_selector.bind("<<ComboboxSelected>>", self._show_selected_preview)
         self.open_preview_button = ttk.Button(
-            preview_frame,
-            text="Open preview image",
+            preview_toolbar,
+            text="Open image",
             command=self._open_preview,
             state="disabled",
         )
-        self.open_preview_button.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.open_preview_button.pack(side="left")
+        display_settings = ttk.Frame(preview_frame)
+        display_settings.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(display_settings, text="Boundary width px").pack(side="left")
+        ttk.Entry(
+            display_settings, textvariable=self.output_vars["ring_boundary_width_px"], width=7
+        ).pack(side="left", padx=(3, 12))
+        ttk.Label(display_settings, text="Max image dimension px").pack(side="left")
+        ttk.Entry(
+            display_settings, textvariable=self.output_vars["preview_max_dimension_px"], width=8
+        ).pack(side="left", padx=3)
         preview_frame.rowconfigure(0, weight=1)
         preview_frame.columnconfigure(0, weight=1)
 
@@ -553,18 +604,10 @@ class BrainSectionGui:
             text="Open output folder when complete",
             variable=self.output_vars["open_output"],
         ).grid(row=0, column=3, padx=12)
-        ttk.Label(run_frame, text="Boundary width px").grid(row=0, column=4, padx=(12, 3))
-        ttk.Entry(
-            run_frame, textvariable=self.output_vars["ring_boundary_width_px"], width=7
-        ).grid(row=0, column=5)
-        ttk.Label(run_frame, text="Max image dimension px").grid(row=0, column=6, padx=(12, 3))
-        ttk.Entry(
-            run_frame, textvariable=self.output_vars["preview_max_dimension_px"], width=8
-        ).grid(row=0, column=7)
         ttk.Label(
             run_frame,
             text="Run parameters and selected file paths are always saved.",
-        ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(7, 0))
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(7, 0))
 
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(2, weight=1)
@@ -835,16 +878,20 @@ class BrainSectionGui:
             self.roi_vars["mask_directory"].set(value)
 
     def _build_config(
-        self, source: Path | None = None, *, require_runtime_paths: bool = False
+        self,
+        source: Path | None = None,
+        *,
+        require_output: bool = False,
+        require_cache: bool = False,
     ) -> dict[str, Any]:
         source = source or self._selected_path()
         config = copy.deepcopy(DEFAULT_CONFIG)
         output_value = self.output_root.get().strip()
         cache_value = self.cache_root.get().strip()
-        if require_runtime_paths and not output_value:
+        if require_output and not output_value:
             raise ValueError("Select an output folder.")
-        if require_runtime_paths and not cache_value:
-            raise ValueError("Select an application cache folder.")
+        if require_cache and not cache_value:
+            raise ValueError("Select a cache folder.")
         output_root = (
             Path(output_value).expanduser().resolve()
             if output_value
@@ -1137,12 +1184,15 @@ class BrainSectionGui:
     def _preview(self) -> None:
         try:
             source = self._selected_path()
-            config = self._build_config(source, require_runtime_paths=True)
+            config = self._build_config(source, require_cache=True)
             config["input"]["zoom"] = float(self.input_vars["preview_zoom"].get())
             config["input"]["output_dir"] = str(Path(self.cache_root.get()).expanduser().resolve() / "preview" / _safe_name(source))
             for key in OUTPUT_SELECTION_DEFAULTS:
                 config["output"][key] = False
-            config["output"]["save_qc"] = True
+            for key in PREVIEW_IMAGE_OUTPUT_KEYS:
+                config["output"][key] = bool(self.output_vars[key].get())
+            if not any(config["output"][key] for key in PREVIEW_IMAGE_OUTPUT_KEYS):
+                raise ValueError("Select at least one preview image under Images and masks.")
             if config["tissue_roi"]["mode"] == "mask_directory":
                 _resolve_mask(config, source)
             self._set_busy(True)
@@ -1166,10 +1216,8 @@ class BrainSectionGui:
 
     def _run(self) -> None:
         try:
-            config = self._build_config(require_runtime_paths=True)
+            config = self._build_config(require_output=True, require_cache=True)
             output_root = self.output_root.get().strip()
-            if not output_root:
-                raise ValueError("Select an output folder.")
             self._set_busy(True)
             self.status.set("Analyzing all images...")
         except Exception as error:
@@ -1201,6 +1249,25 @@ class BrainSectionGui:
         self.open_preview_button.configure(state="normal")
         self.notebook.select(self.output_tab)
 
+    def _set_preview_files(self, files: dict[str, Any]) -> None:
+        self.preview_files = _preview_image_choices(files)
+        choices = tuple(self.preview_files)
+        self.preview_selector.configure(
+            values=choices, state="readonly" if choices else "disabled"
+        )
+        if choices:
+            self.preview_choice.set(choices[0])
+            self._show_selected_preview()
+        else:
+            self.preview_choice.set("")
+            self.preview_label.configure(image="", text="No preview image was generated.")
+            self.open_preview_button.configure(state="disabled")
+
+    def _show_selected_preview(self, _event: Any = None) -> None:
+        path = self.preview_files.get(self.preview_choice.get())
+        if path is not None:
+            self._show_preview(path)
+
     def _open_preview(self) -> None:
         if self.preview_path and self.preview_path.is_file():
             os.startfile(self.preview_path)
@@ -1222,12 +1289,10 @@ class BrainSectionGui:
                     self._set_busy(False)
                     self.status.set("Preview complete")
                     self._set_available_output_columns(value.pop("_tables", {}))
-                    qc_path = value.get("files", {}).get("qc")
-                    if qc_path and Path(qc_path).is_file():
-                        try:
-                            self._show_preview(qc_path)
-                        except Exception as error:
-                            messagebox.showerror("Could not display preview", str(error))
+                    try:
+                        self._set_preview_files(value.get("files", {}))
+                    except Exception as error:
+                        messagebox.showerror("Could not display preview", str(error))
                 elif kind == "complete":
                     self._set_busy(False)
                     self.status.set("Batch analysis complete")

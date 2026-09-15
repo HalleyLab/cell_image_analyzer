@@ -19,6 +19,7 @@ from brain_section_analyzer.analysis import (
     _write_outputs,
     analyze_arrays,
 )
+from brain_section_analyzer.gui import _preview_image_choices
 from brain_section_analyzer.config import (
     DEFAULT_CONFIG,
     OUTPUT_SELECTION_DEFAULTS,
@@ -440,6 +441,16 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         self.assertEqual(int(products.image_summary.iloc[0]["microglia_count_roi"]), 2)
         self.assertEqual(set(products.microglia_cells["nucleus_channel"]), {"cd68"})
         self.assertTrue(products.microglia_cells["confirmation_channel"].eq("").all())
+
+    def test_preview_choices_include_only_generated_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "overview.png"
+            image.write_bytes(b"preview")
+            choices = _preview_image_choices(
+                {"qc": str(image), "processing_images_dir": directory, "missing": str(image.with_name("missing.png"))}
+            )
+
+        self.assertEqual(choices, {"Overview QC": image})
 
     def test_selected_output_columns_are_exact_and_ordered(self) -> None:
         frame = pd.DataFrame({"first": [1], "second": [2], "third": [3]})
