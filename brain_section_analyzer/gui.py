@@ -126,6 +126,7 @@ class BrainSectionGui:
         self.selected_output_columns: dict[str, list[str]] = {}
         self._build()
         self._apply_config(copy.deepcopy(DEFAULT_CONFIG))
+        self.root.bind("<KeyPress>", self._preview_key, add="+")
         self.root.after(100, self._poll_messages)
 
     @staticmethod
@@ -630,6 +631,7 @@ class BrainSectionGui:
             anchor="center",
         )
         self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.preview_label.bind("<Button-1>", lambda _event: self.preview_label.focus_set())
         preview_toolbar = ttk.Frame(preview_frame)
         preview_toolbar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(preview_toolbar, text="Displayed result").pack(side="left")
@@ -642,6 +644,7 @@ class BrainSectionGui:
         )
         self.preview_selector.pack(side="left", padx=5)
         self.preview_selector.bind("<<ComboboxSelected>>", self._show_selected_preview)
+        self.preview_selector.bind("<KeyPress>", self._preview_key, add="+")
         self.open_preview_button = ttk.Button(
             preview_toolbar,
             text="Open image",
@@ -649,6 +652,9 @@ class BrainSectionGui:
             state="disabled",
         )
         self.open_preview_button.pack(side="left")
+        ttk.Label(preview_frame, text="A: previous preview | D: next preview").grid(
+            row=3, column=0, sticky="w", pady=(6, 0)
+        )
         display_settings = ttk.Frame(preview_frame)
         display_settings.grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Label(display_settings, text="Boundary width px").pack(side="left")
@@ -1357,6 +1363,25 @@ class BrainSectionGui:
         path = self.preview_files.get(self.preview_choice.get())
         if path is not None:
             self._show_preview(path)
+
+    def _preview_key(self, event: Any) -> str | None:
+        key = event.keysym.lower()
+        if key not in {"a", "d"} or event.state & (0x4 | 0x8 | 0x20000):
+            return None
+        if self.notebook.select() != str(self.output_tab):
+            return None
+        if event.widget is not self.preview_selector and event.widget.winfo_class() in {
+            "Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox",
+        }:
+            return None
+        choices = tuple(self.preview_files)
+        if not choices:
+            return None
+        current = self.preview_choice.get()
+        index = choices.index(current) if current in choices else 0
+        self.preview_choice.set(choices[(index + (1 if key == "d" else -1)) % len(choices)])
+        self._show_selected_preview()
+        return "break"
 
     def _open_preview(self) -> None:
         if self.preview_path and self.preview_path.is_file():

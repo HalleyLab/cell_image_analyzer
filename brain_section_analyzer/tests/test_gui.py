@@ -1,6 +1,8 @@
 """Run with python -m unittest brain_section_analyzer.tests.test_gui."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 from tkinter import ttk
 
 from tkinterdnd2 import TkinterDnD
@@ -29,6 +31,45 @@ class SessionButtonTests(unittest.TestCase):
                     self.assertEqual(len({b.winfo_reqwidth() for b in gui.session_buttons}), 1)
                 finally:
                     root.destroy()
+
+
+    def test_preview_ad_navigation_wraps_and_does_not_intercept_parameter_typing(self):
+        root = TkinterDnD.Tk()
+        root.withdraw()
+        try:
+            gui = BrainSectionGui(root)
+            gui.notebook.select(gui.output_tab)
+            gui.preview_files = {"First": None, "Second": None, "Third": None}
+            gui.preview_choice.set("First")
+            gui._show_selected_preview = Mock()
+            event = SimpleNamespace(keysym="d", state=0, widget=gui.preview_label)
+            self.assertEqual(gui._preview_key(event), "break")
+            self.assertEqual(gui.preview_choice.get(), "Second")
+            event.keysym = "A"
+            gui._preview_key(event)
+            self.assertEqual(gui.preview_choice.get(), "First")
+            gui._preview_key(event)
+            self.assertEqual(gui.preview_choice.get(), "Third")
+            event.keysym = "d"
+            event.widget = gui.preview_selector
+            gui._preview_key(event)
+            self.assertEqual(gui.preview_choice.get(), "First")
+            entry = ttk.Entry(root)
+            event.widget = entry
+            self.assertIsNone(gui._preview_key(event))
+            self.assertEqual(gui.preview_choice.get(), "First")
+            event.widget = gui.preview_label
+            event.state = 0x4
+            self.assertIsNone(gui._preview_key(event))
+            event.state = 0
+            gui.notebook.select(0)
+            self.assertIsNone(gui._preview_key(event))
+            gui.notebook.select(gui.output_tab)
+            gui.preview_files = {}
+            self.assertIsNone(gui._preview_key(event))
+            self.assertEqual(gui._show_selected_preview.call_count, 4)
+        finally:
+            root.destroy()
 
 
 if __name__ == "__main__":
