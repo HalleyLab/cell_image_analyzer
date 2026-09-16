@@ -49,7 +49,7 @@ def _export_table(
     }
     replacements = {
         **role_names,
-        "plaque": "primary_object",
+        "plaque": "reference_object",
         "microglia": "cell",
         "neuron": "excluded_object",
     }
@@ -86,7 +86,11 @@ def _select_output_columns(
     selections = config.get("output", {}).get("table_columns", {})
     if table_name not in selections:
         return frame
-    columns = [column for column in selections[table_name] if column in frame.columns]
+    requested = [
+        column if column in frame.columns else column.replace("primary_object", "reference_object")
+        for column in selections[table_name]
+    ]
+    columns = [column for column in requested if column in frame.columns]
     return frame.loc[:, columns]
 
 
@@ -1070,7 +1074,6 @@ def analyze_arrays(
     raw_images, positive_masks, thresholds = _threshold_channels(images, config, tissue)
 
     # Every enabled channel is filtered independently after thresholding.
-    # Channel 1 then receives its additional primary-object segmentation rules.
     marker_labels: dict[str, np.ndarray] = {}
     marker_tables: list[pd.DataFrame] = []
     for role in (role for role in ("abeta", "iba1", "cd68", "dapi") if role in positive_masks):
@@ -1087,19 +1090,20 @@ def analyze_arrays(
         marker_tables.append(table)
     marker_component_qc = pd.concat(marker_tables, ignore_index=True, sort=False)
 
-    abeta_detection_image = preprocess_channel(
-        images["abeta"], config["channels"]["abeta"]
+    reference_role = config["plaque"].get("reference_channel", "abeta")
+    reference_detection_image = preprocess_channel(
+        images[reference_role], config["channels"][reference_role]
     ).analysis_image
     plaque_mask, plaque_labels, neuron_like_mask, candidate_qc = _segment_plaque_candidates(
-        positive_masks["abeta"],
+        positive_masks[reference_role],
         config,
         pixel_area_um2,
-        intensity_image=raw_images["abeta"],
-        detection_image=abeta_detection_image,
-        abeta_threshold=thresholds["abeta"],
+        intensity_image=raw_images[reference_role],
+        detection_image=reference_detection_image,
+        abeta_threshold=thresholds[reference_role],
         domain_mask=tissue,
     )
-    positive_masks["abeta"] = plaque_mask
+    positive_masks[reference_role] = plaque_mask
 
     edges = config["spatial"]["ring_edges_um"]
     distance, nearest_labels, ring_masks = _plaque_spatial_maps(
@@ -1192,7 +1196,7 @@ def analyze_arrays(
         microglia_absent_plaque_mask = plaque_mask & (filtered_labels == 0)
         plaque_labels = filtered_labels
         plaque_mask = plaque_labels > 0
-        positive_masks["abeta"] = plaque_mask
+        positive_masks[reference_role] = plaque_mask
         distance, nearest_labels, ring_masks = _plaque_spatial_maps(
             plaque_mask,
             plaque_labels,
@@ -1218,7 +1222,7 @@ def analyze_arrays(
         config["plaque"].get("exclude_boundary_plaques_from_table", True)
     )
     all_regions = measure.regionprops(
-        plaque_labels, intensity_image=raw_images["abeta"]
+        plaque_labels, intensity_image=raw_images[reference_role]
     )
     boundary_labels = set(
         int(value) for value in np.unique(plaque_labels[boundary]) if value > 0
@@ -1242,11 +1246,12 @@ def analyze_arrays(
         "nearby_microglia_filter_enabled": require_nearby_microglia,
         "nearby_microglia_radius_um": nearby_radius_um,
         "min_nearby_microglia_count": minimum_nearby_microglia,
-        "abeta_candidate_count_before_neuron_exclusion": int(len(candidate_qc)),
-        "abeta_neuron_like_excluded_count": int(
+        "plaque_reference_channel": config["channels"][reference_role]["alias"],
+        "plaque_candidate_count_before_neuron_exclusion": int(len(candidate_qc)),
+        "plaque_neuron_like_excluded_count": int(
             candidate_qc["neuron_like_excluded"].sum()
         ),
-        "abeta_neuron_like_excluded_area_um2": float(
+        "plaque_neuron_like_excluded_area_um2": float(
             candidate_qc.loc[
                 candidate_qc["neuron_like_excluded"], "candidate_area_um2"
             ].sum()
@@ -1349,9 +1354,9 @@ def analyze_arrays(
             ),
             "plaque_solidity": float(region.solidity),
             "plaque_eccentricity": float(region.eccentricity),
-            "abeta_mean_intensity_in_plaque": float(region.intensity_mean),
-            "abeta_integrated_intensity_in_plaque": float(
-                np.asarray(raw_images["abeta"], dtype=float)[region_mask].sum()
+            f"{reference_role}_mean_intensity_in_plaque": float(region.intensity_mean),
+            f"{reference_role}_integrated_intensity_in_plaque": float(
+                np.asarray(raw_images[reference_role], dtype=float)[region_mask].sum()
             ),
         }
         for key, value in config.get("metadata", {}).items():
@@ -1404,8 +1409,8 @@ def analyze_arrays(
                 "plaque_circularity",
                 "plaque_solidity",
                 "plaque_eccentricity",
-                "abeta_mean_intensity_in_plaque",
-                "abeta_integrated_intensity_in_plaque",
+                f"{reference_role}_mean_intensity_in_plaque",
+                f"{reference_role}_integrated_intensity_in_plaque",
                 "nearby_microglia_count",
                 *config.get("metadata", {}).keys(),
             ]
@@ -1481,6 +1486,7 @@ def _save_qc(
     channel_colors: dict[str, tuple[float, float, float]],
     channel_names: dict[str, str],
     cell_count_config: dict[str, Any],
+    reference_role: str,
     selected_qc_panels: list[str],
     processing_dir: Path | None = None,
     save_raw_channels: bool = True,
@@ -1507,9 +1513,9 @@ def _save_qc(
     neuron_boundaries = segmentation.find_boundaries(neuron_like, mode="outer")
     no_microglia_boundaries = segmentation.find_boundaries(no_microglia, mode="outer")
     tissue_boundaries = segmentation.find_boundaries(tissue, mode="inner")
-    abeta_overlay = _overlay(tinted["abeta"], plaque_boundaries, (0.0, 1.0, 1.0))
-    abeta_overlay = _overlay(abeta_overlay, neuron_boundaries, (1.0, 0.0, 1.0))
-    abeta_overlay = _overlay(abeta_overlay, no_microglia_boundaries, (1.0, 0.5, 0.0))
+    reference_overlay = _overlay(tinted[reference_role], plaque_boundaries, (0.0, 1.0, 1.0))
+    reference_overlay = _overlay(reference_overlay, neuron_boundaries, (1.0, 0.0, 1.0))
+    reference_overlay = _overlay(reference_overlay, no_microglia_boundaries, (1.0, 0.5, 0.0))
     object_boundary_colors = {
         "abeta": (0.0, 1.0, 1.0),
         "iba1": (0.0, 1.0, 0.0),
@@ -1532,8 +1538,8 @@ def _save_qc(
         ("05_composite", "Composite: selected channel colors", composite),
         (
             "06_primary_object_segmentation",
-            f"{channel_names['abeta']}: primary objects cyan; excluded objects magenta; no-nearby-cell orange",
-            abeta_overlay,
+            f"{channel_names[reference_role]}: reference objects cyan; excluded objects magenta; no-nearby-cell orange",
+            reference_overlay,
         ),
     ]
     for index, role in enumerate(("abeta", "iba1", "cd68", "dapi"), start=1):
@@ -1576,7 +1582,7 @@ def _save_qc(
             width_px=ring_boundary_width_px,
         )
         panels.append(
-            ("10_primary_object_distance_rings", "Primary-object distance-ring boundaries yellow", ring_overlay)
+            ("10_primary_object_distance_rings", "Neighbour distance-ring boundaries yellow", ring_overlay)
         )
     panels.append(("11_tissue_roi", "Tissue ROI boundary magenta", tissue_overlay))
     processing_panels = panels
@@ -1621,13 +1627,13 @@ def _save_qc(
             saved[f"processing_{name}"] = str(filename)
         if save_mask_images:
             mask_images = {
-                "channel_1_primary_object_mask": _tint(
-                    products.positive_masks["abeta"][sl].astype(float), channel_colors["abeta"]
+                "neighbour_reference_object_mask": _tint(
+                    products.positive_masks[reference_role][sl].astype(float), channel_colors[reference_role]
                 ),
-                "channel_1_excluded_object_mask": _tint(
+                "neighbour_excluded_object_mask": _tint(
                     products.neuron_like_mask[sl].astype(float), (1.0, 0.0, 1.0)
                 ),
-                "channel_1_no_nearby_cell_excluded": _tint(
+                "neighbour_no_nearby_cell_excluded": _tint(
                     products.microglia_absent_plaque_mask[sl].astype(float), (1.0, 0.5, 0.0)
                 ),
             }
@@ -1694,11 +1700,11 @@ def _write_outputs(
 ) -> tuple[dict[str, str], dict[str, pd.DataFrame]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     image_csv = output_dir / "image_summary.csv"
-    plaque_csv = output_dir / "primary_object_measurements.csv"
-    candidate_csv = output_dir / "channel_1_candidate_qc.csv"
+    plaque_csv = output_dir / "neighbour_object_measurements.csv"
+    candidate_csv = output_dir / "neighbour_candidate_qc.csv"
     marker_csv = output_dir / "channel_object_qc.csv"
     microglia_csv = output_dir / "cells.csv"
-    ring_csv = output_dir / "primary_object_ring_metrics.csv"
+    ring_csv = output_dir / "neighbour_ring_metrics.csv"
     excel_path = output_dir / "cell_analysis_measurements.xlsx"
     ring_table = _plaque_ring_metrics_table(
         products.plaque_measurements, list(products.ring_masks)
@@ -1747,8 +1753,8 @@ def _write_outputs(
     if bool(config["output"].get("save_excel", True)):
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             selected_tables["image_summary"].to_excel(writer, sheet_name="Image Summary", index=False)
-            selected_tables["primary_objects"].to_excel(writer, sheet_name="Primary Objects", index=False)
-            selected_tables["candidate_qc"].to_excel(writer, sheet_name="Channel 1 QC", index=False)
+            selected_tables["primary_objects"].to_excel(writer, sheet_name="Neighbour Objects", index=False)
+            selected_tables["candidate_qc"].to_excel(writer, sheet_name="Neighbour QC", index=False)
             selected_tables["channel_objects"].to_excel(writer, sheet_name="Channel Objects", index=False)
             selected_tables["cells"].to_excel(writer, sheet_name="Cells", index=False)
             selected_tables["ring_metrics"].to_excel(writer, sheet_name="Object Ring Metrics", index=False)
@@ -1773,14 +1779,14 @@ def _write_outputs(
         )
         paths["tissue_mask"] = str(tissue_path)
     if bool(output.get("save_primary_object_labels", True)):
-        labels_path = output_dir / "primary_object_labels.tiff"
+        labels_path = output_dir / "neighbour_reference_labels.tiff"
         tifffile.imwrite(
             labels_path, products.plaque_labels.astype(np.uint32), compression="zlib"
         )
         paths["plaque_labels"] = str(labels_path)
     if bool(output.get("save_excluded_object_masks", True)):
-        neuron_path = output_dir / "channel_1_excluded_objects.tiff"
-        no_microglia_path = output_dir / "channel_1_no_nearby_cell_excluded.tiff"
+        neuron_path = output_dir / "neighbour_excluded_objects.tiff"
+        no_microglia_path = output_dir / "neighbour_no_nearby_cell_excluded.tiff"
         tifffile.imwrite(
             neuron_path,
             products.neuron_like_mask.astype(np.uint8),
@@ -1877,6 +1883,7 @@ def _write_outputs(
                 channel_colors,
                 channel_names,
                 config["microglia_count"],
+                config["plaque"].get("reference_channel", "abeta"),
                 list(output.get("qc_panels", [])),
                 output_dir / "processing_images" if save_processing else None,
                 **processing_flags,
@@ -1933,7 +1940,7 @@ def run_analysis(
         raise ValueError("Physical X/Y pixel calibration is required for cell analysis.")
     effective_x = float(pixel_x) / input_config["zoom"]
     effective_y = float(pixel_y) / input_config["zoom"]
-    _notify(progress, "Segmenting primary objects and measuring neighborhood rings...")
+    _notify(progress, "Running neighbour analysis and measuring distance rings...")
     products = analyze_arrays(
         images,
         config,
@@ -1957,5 +1964,5 @@ def run_analysis(
     summary_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     if include_tables:
         result["_tables"] = tables
-    _notify(progress, f"Complete: {result['plaque_count_all']} primary objects detected.")
+    _notify(progress, f"Complete: {result['plaque_count_all']} reference objects detected.")
     return result

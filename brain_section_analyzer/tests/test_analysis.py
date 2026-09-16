@@ -132,6 +132,26 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         self.assertGreater(summary["ring_0_10um_cd68_in_iba1_fraction_of_iba1"], 0.4)
         self.assertLess(summary["ring_0_10um_cd68_in_iba1_fraction_of_iba1"], 0.6)
 
+    def test_neighbour_analysis_uses_selected_reference_channel(self) -> None:
+        shape = (80, 80)
+        images = {
+            role: np.zeros(shape, dtype=np.uint16)
+            for role in ("abeta", "iba1", "cd68")
+        }
+        channel_1_rr, channel_1_cc = disk((20, 20), 5, shape=shape)
+        channel_3_rr, channel_3_cc = disk((60, 60), 5, shape=shape)
+        images["abeta"][channel_1_rr, channel_1_cc] = 100
+        images["cd68"][channel_3_rr, channel_3_cc] = 100
+        config = manual_config()
+        config["plaque"]["reference_channel"] = "cd68"
+
+        products = analyze_arrays(
+            images, config, pixel_size_um_x=1, pixel_size_um_y=1
+        )
+
+        self.assertEqual(int(products.plaque_labels[60, 60]), 1)
+        self.assertEqual(int(products.plaque_labels[20, 20]), 0)
+
     def test_boundary_plaque_retained_in_burden_but_excluded_from_table(self) -> None:
         shape = (80, 80)
         abeta = np.zeros(shape, dtype=np.uint16)
@@ -217,7 +237,7 @@ class BrainSectionAnalysisTests(unittest.TestCase):
             pixel_size_um_y=1,
         )
         summary = products.image_summary.iloc[0]
-        self.assertEqual(int(summary["abeta_neuron_like_excluded_count"]), 1)
+        self.assertEqual(int(summary["plaque_neuron_like_excluded_count"]), 1)
         self.assertEqual(int(summary["plaque_count_all"]), 1)
         self.assertTrue(products.neuron_like_mask[30, 34])
         self.assertGreater(products.plaque_labels[70, 70], 0)
@@ -506,7 +526,7 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         self.assertEqual(
             written,
             {
-                "primary_object_measurements.csv",
+                "neighbour_object_measurements.csv",
                 "config_used.yaml",
                 "image_metadata.json",
             },
@@ -517,7 +537,7 @@ class BrainSectionAnalysisTests(unittest.TestCase):
         self.assertEqual(len(tables["primary_objects"]), 1)
         self.assertEqual(
             saved_columns,
-            ["primary_object_id", "primary_object_area_um2"],
+            ["reference_object_id", "reference_object_area_um2"],
         )
 
 if __name__ == "__main__":

@@ -143,6 +143,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "invert_mask": False,
     },
     "plaque": {
+        "reference_channel": "abeta",
         "opening_radius_px": 0,
         "closing_radius_px": 1,
         "fill_holes": False,
@@ -453,6 +454,9 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     roi["invert_mask"] = bool(roi.get("invert_mask", False))
 
     plaque = merged["plaque"]
+    plaque["reference_channel"] = str(plaque.get("reference_channel", "abeta"))
+    if plaque["reference_channel"] not in roles:
+        raise ValueError("Neighbour analysis must select an enabled reference channel.")
     plaque["opening_radius_px"] = max(0, int(plaque.get("opening_radius_px", 0)))
     plaque["closing_radius_px"] = max(0, int(plaque.get("closing_radius_px", 0)))
     plaque["fill_holes"] = bool(plaque.get("fill_holes", False))

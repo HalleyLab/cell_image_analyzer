@@ -295,7 +295,7 @@ def run_batch_analysis(
                     "source_file": str(path),
                     "source_name": path.name,
                     "status": "complete",
-                    "primary_object_count_all": result["plaque_count_all"],
+                    "reference_object_count_all": result["plaque_count_all"],
                     "output_dir": str(output_dir),
                     "error": "",
                 }
@@ -307,7 +307,7 @@ def run_batch_analysis(
                     "source_file": str(path),
                     "source_name": path.name,
                     "status": "failed",
-                    "primary_object_count_all": 0,
+                    "reference_object_count_all": 0,
                     "output_dir": str(output_dir),
                     "error": str(error),
                 }
@@ -365,11 +365,11 @@ def run_batch_analysis(
     animals = _animal_summary(combined_images, combined_plaques)
     batch_summary_path = root / "batch_summary.csv"
     image_path = root / "combined_image_summary.csv"
-    plaque_path = root / "combined_primary_object_measurements.csv"
-    candidate_path = root / "combined_channel_1_candidate_qc.csv"
+    plaque_path = root / "combined_neighbour_object_measurements.csv"
+    candidate_path = root / "combined_neighbour_candidate_qc.csv"
     marker_path = root / "combined_channel_object_qc.csv"
     microglia_path = root / "combined_cells.csv"
-    ring_path = root / "combined_primary_object_ring_metrics.csv"
+    ring_path = root / "combined_neighbour_ring_metrics.csv"
     animal_path = root / "animal_summary.csv"
     excel_path = root / "cell_analysis_batch_results.xlsx"
     public_images = _select_output_columns(
@@ -420,8 +420,8 @@ def run_batch_analysis(
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             public_batch_summary.to_excel(writer, sheet_name="Batch Summary", index=False)
             public_images.to_excel(writer, sheet_name="Image Summary", index=False)
-            public_objects.to_excel(writer, sheet_name="Primary Objects", index=False)
-            public_candidates.to_excel(writer, sheet_name="Channel 1 QC", index=False)
+            public_objects.to_excel(writer, sheet_name="Neighbour Objects", index=False)
+            public_candidates.to_excel(writer, sheet_name="Neighbour QC", index=False)
             public_channels.to_excel(writer, sheet_name="Channel Objects", index=False)
             public_cells.to_excel(writer, sheet_name="Cells", index=False)
             public_rings.to_excel(writer, sheet_name="Object Ring Metrics", index=False)

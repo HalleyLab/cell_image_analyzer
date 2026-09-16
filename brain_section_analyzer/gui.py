@@ -49,7 +49,7 @@ PREVIEW_IMAGE_OUTPUT_KEYS = (
 )
 QC_PANEL_LABELS = {
     "05_composite": "Composite",
-    "06_primary_object_segmentation": "Primary-object segmentation",
+    "06_primary_object_segmentation": "Neighbour-reference segmentation",
     "07_channel_1_objects": "Channel 1 object filter",
     "07_channel_2_objects": "Channel 2 object filter",
     "07_channel_3_objects": "Channel 3 object filter",
@@ -71,11 +71,11 @@ TABLE_FILE_OUTPUT_KEYS = {
 OUTPUT_TABLE_LABELS = {
     "batch_summary": "Batch Summary",
     "image_summary": "Image Summary",
-    "primary_objects": "Primary Objects",
-    "candidate_qc": "Channel 1 Candidate QC",
+    "primary_objects": "Neighbour Objects",
+    "candidate_qc": "Neighbour Candidate QC",
     "channel_objects": "Channel Objects",
     "cells": "Cells",
-    "ring_metrics": "Primary-object Ring Metrics",
+    "ring_metrics": "Neighbour Ring Metrics",
     "animal_summary": "Animal Summary",
     "thresholds": "Thresholds (per-image Excel)",
 }
@@ -84,7 +84,7 @@ BATCH_SUMMARY_COLUMNS = (
     "source_file",
     "source_name",
     "status",
-    "primary_object_count_all",
+    "reference_object_count_all",
     "output_dir",
     "error",
 )
@@ -202,7 +202,7 @@ class BrainSectionGui:
         output_tab = ttk.Frame(notebook, padding=8)
         notebook.add(input_tab, text="Image & ROI")
         notebook.add(channels_tab, text="Channels")
-        notebook.add(plaque_tab, text="Primary Objects")
+        notebook.add(plaque_tab, text="Neighbour Analysis")
         notebook.add(microglia_tab, text="Cell Counting")
         notebook.add(output_tab, text="Outputs")
         self.output_tab = output_tab
@@ -400,6 +400,7 @@ class BrainSectionGui:
 
     def _build_plaque_tab(self, parent: ttk.Frame) -> None:
         self.plaque_vars = {
+            "reference_channel": tk.StringVar(value=ROLE_LABELS[ROLES[0]]),
             "opening_radius_px": tk.StringVar(value="0"),
             "closing_radius_px": tk.StringVar(value="1"),
             "fill_holes": tk.BooleanVar(value=False),
@@ -429,7 +430,8 @@ class BrainSectionGui:
             "ring_edges_um": tk.StringVar(),
         }
         frames = [
-            ("Primary-object morphology", [
+            ("Reference-object morphology", [
+                ("Reference object channel", "reference_channel", tuple(ROLE_LABELS.values())),
                 ("Open px", "opening_radius_px", None),
                 ("Close px", "closing_radius_px", None),
                 ("Fill holes", "fill_holes", None),
@@ -454,11 +456,11 @@ class BrainSectionGui:
                 ("Require nearby cells", "require_nearby_microglia", None),
                 ("Nearby-cell radius µm", "nearby_microglia_radius_um", None),
                 ("Minimum nearby-cell count", "min_nearby_microglia_count", None),
-                ("Split touching primary objects", "split_touching", None),
+                ("Split touching reference objects", "split_touching", None),
                 ("Minimum peak distance px", "min_peak_distance_px", None),
                 ("Minimum peak height px", "watershed_min_peak_height_px", None),
                 ("Watershed compactness", "watershed_compactness", None),
-                ("Exclude boundary primary objects from table", "exclude_boundary_plaques_from_table", None),
+                ("Exclude boundary reference objects from table", "exclude_boundary_plaques_from_table", None),
                 ("Boundary margin µm", "boundary_margin_um", None),
                 ("Cumulative ranges µm (e.g. 0,15,30)", "ring_edges_um", None),
             ]),
@@ -471,8 +473,8 @@ class BrainSectionGui:
         ttk.Label(
             parent,
             text=(
-                "Primary objects are the final Channel 1 objects used for per-object "
-                "measurements, distance rings, and nearby-cell counts."
+                "Neighbour analysis uses the selected reference-object channel for "
+                "per-object measurements, distance rings, and nearby-cell counts."
             ),
             wraplength=1200,
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(10, 0))
@@ -573,7 +575,7 @@ class BrainSectionGui:
             ("Segmentation overlay images", "save_segmentation_images"),
             ("Mask preview images", "save_mask_images"),
             ("Tissue ROI mask TIFF", "save_tissue_mask"),
-            ("Primary-object label TIFF", "save_primary_object_labels"),
+            ("Neighbour-reference label TIFF", "save_primary_object_labels"),
             ("Excluded-object mask TIFFs", "save_excluded_object_masks"),
             ("Channel-object label TIFF", "save_channel_object_labels"),
             ("Nucleus / cell label TIFFs", "save_cell_labels"),
@@ -708,10 +710,10 @@ class BrainSectionGui:
             "image_count",
             "roi_area_um2",
             "roi_area_mm2",
-            "primary_object_count_all",
-            "primary_object_count_boundary",
-            "primary_object_count_interior",
-            "primary_object_density_all_per_mm2",
+            "reference_object_count_all",
+            "reference_object_count_boundary",
+            "reference_object_count_interior",
+            "reference_object_density_all_per_mm2",
         ]
         animal_columns.extend(
             column
@@ -722,8 +724,8 @@ class BrainSectionGui:
         )
         animal_columns.extend(
             (
-                "median_interior_primary_object_area_um2",
-                "mean_interior_primary_object_area_um2",
+                "median_interior_reference_object_area_um2",
+                "mean_interior_reference_object_area_um2",
             )
         )
         available["animal_summary"] = list(dict.fromkeys(animal_columns))
@@ -1024,6 +1026,7 @@ class BrainSectionGui:
         plaque = self.plaque_vars
         config["plaque"].update(
             {
+                "reference_channel": ROLE_BY_LABEL.get(plaque["reference_channel"].get()),
                 "opening_radius_px": int(plaque["opening_radius_px"].get()),
                 "closing_radius_px": int(plaque["closing_radius_px"].get()),
                 "fill_holes": bool(plaque["fill_holes"].get()),
@@ -1153,6 +1156,8 @@ class BrainSectionGui:
             if key == "ring_edges_um":
                 value = config.get("spatial", {}).get("ring_edges_um", [])
                 variable.set(",".join(str(item) for item in value))
+            elif key == "reference_channel":
+                variable.set(ROLE_LABELS.get(plaque.get(key, "abeta"), ROLE_LABELS["abeta"]))
             else:
                 value = plaque.get(key, DEFAULT_CONFIG["plaque"].get(key))
                 variable.set("" if value is None else value)
