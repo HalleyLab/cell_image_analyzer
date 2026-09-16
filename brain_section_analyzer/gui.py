@@ -214,15 +214,29 @@ class BrainSectionGui:
 
         controls = ttk.Frame(outer, padding=(0, 6))
         controls.pack(fill="x", pady=(8, 0))
-        ttk.Button(
-            controls, text="Load parameters", padding=(12, 7), command=self._load_session
-        ).pack(side="left", padx=3)
-        ttk.Button(
-            controls, text="Save parameters", padding=(12, 7), command=self._save_parameters
-        ).pack(side="left", padx=3)
-        ttk.Button(
-            controls, text="Save session", padding=(12, 7), command=self._save_session
-        ).pack(side="left", padx=3)
+        style = ttk.Style(self.root)
+        style.configure(
+            "Session.TButton", anchor="center", justify="center",
+            padding=(12, 8, 12, 8), width=18,
+        )
+        style.layout("Session.TButton", [
+            ("Button.button", {"sticky": "nswe", "children": [
+                ("Button.focus", {"sticky": "nswe", "children": [
+                    ("Button.padding", {"sticky": "nswe", "children": [
+                        ("Button.label", {"sticky": ""}),
+                    ]}),
+                ]}),
+            ]}),
+        ])
+        self.session_buttons = []
+        for label, command in (
+            ("Load parameters", self._load_session),
+            ("Save parameters", self._save_parameters),
+            ("Save session", self._save_session),
+        ):
+            button = ttk.Button(controls, text=label, style="Session.TButton", command=command)
+            button.pack(side="left", padx=3)
+            self.session_buttons.append(button)
         self.status = tk.StringVar(value="Ready")
         ttk.Label(controls, textvariable=self.status).pack(side="left", padx=12)
 
