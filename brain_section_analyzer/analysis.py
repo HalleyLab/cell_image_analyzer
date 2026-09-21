@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +26,9 @@ from cell_analyzer.preprocessing import preprocess_channel
 from cell_analyzer.segmentation import threshold_image
 
 from .config import load_config, normalize_config, save_config
+from .advanced import ROLES, analyze_relationships
+from .advanced_features import ADVANCED_TABLES, analyze_features
+from .plots import _display_scale, _tint, _overlay, _selected_qc_panels, save_qc as _save_qc
 
 
 ProgressCallback = Callable[[str], None]
@@ -45,7 +48,7 @@ def _export_table(
             "_",
             str(config["channels"][role]["alias"]).lower(),
         ).strip("_")
-        for role in ("abeta", "iba1", "cd68", "dapi")
+        for role in config["channels"]
     }
     replacements = {
         **role_names,
@@ -113,6 +116,12 @@ class AnalysisProducts:
     positive_masks: dict[str, np.ndarray]
     ring_masks: dict[str, np.ndarray]
     thresholds: dict[str, float | None]
+    neighbour_enabled: bool = True
+    stages: dict = field(default_factory=dict)
+    advanced_maps: dict = field(default_factory=dict)
+    advanced_metrics: pd.DataFrame = field(default_factory=pd.DataFrame)
+    object_distances: pd.DataFrame = field(default_factory=pd.DataFrame)
+    feature_tables: dict = field(default_factory=dict)
 
 
 def _notify(callback: ProgressCallback | None, message: str) -> None:
@@ -178,13 +187,12 @@ def _threshold_channels(
     images: dict[str, np.ndarray],
     config: dict[str, Any],
     tissue_mask: np.ndarray,
+    stages: dict | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, float | None]]:
     raw_images: dict[str, np.ndarray] = {}
     masks: dict[str, np.ndarray] = {}
     thresholds: dict[str, float | None] = {}
-    for role in ("abeta", "iba1", "cd68", "dapi"):
-        if role not in images:
-            continue
+    for position, role in enumerate(images, 1):
         processed = preprocess_channel(images[role], config["channels"][role])
         threshold_config = config["channels"][role]["threshold"]
         mask, threshold = threshold_image(
@@ -197,6 +205,10 @@ def _threshold_channels(
         raw_images[role] = np.asarray(processed.raw)
         masks[role] = np.asarray(mask & tissue_mask, dtype=bool)
         thresholds[role] = threshold
+        if stages is not None:
+            prefix = f"stage_channel_{position}"
+            stages[prefix + "_gaussian"] = ("image", processed.analysis_image, role)
+            stages[prefix + "_threshold"] = ("mask", masks[role], role)
     return raw_images, masks, thresholds
 
 
@@ -205,7 +217,9 @@ def _filter_marker_components(
     object_filter: dict[str, Any],
     pixel_area_um2: float,
     role: str,
+    channel_position: int | None = None,
     intensity_image: np.ndarray | None = None,
+    stages: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """Clean and filter connected channel objects using transparent rules."""
 
@@ -233,6 +247,11 @@ def _filter_marker_components(
                 )
 
     candidates = measure.label(cleaned, connectivity=2)
+    if stages is not None:
+        position = channel_position or list(ROLES).index(role) + 1
+        prefix = f"stage_channel_{position}"
+        stages[prefix + "_morphology"] = ("mask", cleaned, role)
+        stages[prefix + "_candidates"] = ("labels", candidates, role)
     minimum_area_px = max(
         1,
         int(
@@ -328,6 +347,9 @@ def _filter_marker_components(
                 "component_max_intensity",
             ]
         )
+    if stages is not None:
+        stages[prefix + "_accepted"] = ("mask", labels > 0, role)
+        stages[prefix + "_rejected"] = ("mask", cleaned & (labels == 0), role)
     return labels > 0, labels, table
 
 
@@ -426,6 +448,7 @@ def _segment_microglia_nuclei(
     plaque_distance_um: np.ndarray,
     nearest_plaque_labels: np.ndarray,
     ring_edges_um: list[float],
+    stages: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """Identify nuclei and optionally retain only confirmation-positive cells."""
 
@@ -441,6 +464,8 @@ def _segment_microglia_nuclei(
         cleaned = ndi.binary_fill_holes(cleaned)
 
     components = measure.label(cleaned, connectivity=2)
+    if stages is not None:
+        stages["stage_nucleus_cleaned"] = ("mask", cleaned, nucleus_role)
     if bool(settings["split_touching"]) and np.any(cleaned):
         nucleus_distance = ndi.distance_transform_edt(cleaned)
         coordinates = feature.peak_local_max(
@@ -462,6 +487,9 @@ def _segment_microglia_nuclei(
             markers[row, column] = next_marker
             next_marker += 1
         candidates = segmentation.watershed(-nucleus_distance, markers, mask=cleaned)
+        if stages is not None:
+            stages["stage_nucleus_distance"] = ("heatmap", nucleus_distance, nucleus_role)
+            stages["stage_nucleus_seeds"] = ("labels", markers, nucleus_role)
     else:
         candidates = components
 
@@ -593,6 +621,10 @@ def _segment_microglia_nuclei(
         "distance_to_nearest_plaque_um", "distance_ring",
     ]
     table = pd.DataFrame.from_records(records)
+    if stages is not None:
+        stages["stage_nucleus_candidates"] = ("labels", candidates, nucleus_role)
+        stages["stage_nucleus_accepted"] = ("labels", nucleus_labels, nucleus_role)
+        stages["stage_cell_accepted"] = ("labels", microglia_labels, nucleus_role)
     return nucleus_labels, microglia_labels, table if not table.empty else pd.DataFrame(columns=columns)
 
 
@@ -676,6 +708,7 @@ def _segment_plaque_candidates(
     detection_image: np.ndarray | None = None,
     abeta_threshold: float | None = None,
     domain_mask: np.ndarray | None = None,
+    stages: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
     plaque_config = config["plaque"]
     cleaned = np.asarray(mask, dtype=bool)
@@ -693,6 +726,8 @@ def _segment_plaque_candidates(
             hole_area_px = max(1, int(math.ceil(max_hole_area_um2 / pixel_area_um2)))
             cleaned = morphology.remove_small_holes(cleaned, area_threshold=hole_area_px)
 
+    if stages is not None:
+        stages["stage_reference_cleaned"] = ("mask", cleaned, config["plaque"].get("reference_channel", "abeta"))
     components = measure.label(cleaned, connectivity=2)
     domain = (
         np.ones(cleaned.shape, dtype=bool)
@@ -724,6 +759,8 @@ def _segment_plaque_candidates(
         if neuron_like:
             neuron_like_mask[components == int(region.label)] = True
     cleaned = cleaned & ~neuron_like_mask
+    if stages is not None:
+        stages["stage_reference_after_exclusion"] = ("mask", cleaned, config["plaque"].get("reference_channel", "abeta"))
     components = measure.label(cleaned, connectivity=2)
     if bool(plaque_config.get("split_touching", False)) and np.any(cleaned):
         distance = ndi.distance_transform_edt(cleaned)
@@ -756,6 +793,12 @@ def _segment_plaque_candidates(
         )
     else:
         candidates = components
+    if stages is not None:
+        reference_role = config["plaque"].get("reference_channel", "abeta")
+        stages["stage_reference_watershed"] = ("labels", candidates, reference_role)
+        if bool(plaque_config.get("split_touching", False)) and np.any(cleaned):
+            stages["stage_reference_distance"] = ("heatmap", distance, reference_role)
+            stages["stage_reference_seeds"] = ("labels", markers, reference_role)
     min_area_px = max(1, int(math.ceil(plaque_config["min_area_um2"] / pixel_area_um2)))
     max_area_um2 = plaque_config.get("max_area_um2")
     max_area_px = (
@@ -951,7 +994,7 @@ def _mask_metrics(
     result: dict[str, float] = {}
     region_pixels = int(region_mask.sum())
     result["area_um2"] = region_pixels * pixel_area_um2
-    for role in ("abeta", "iba1", "cd68"):
+    for role in positive_masks:
         selected = region_mask & positive_masks[role]
         count = int(selected.sum())
         intensity_sum = float(np.asarray(raw_images[role], dtype=float)[selected].sum())
@@ -964,32 +1007,34 @@ def _mask_metrics(
             if count
             else float("nan")
         )
-    intersections = {
-        "cd68_in_iba1": positive_masks["cd68"] & positive_masks["iba1"],
-        "abeta_in_cd68": positive_masks["abeta"] & positive_masks["cd68"],
-        "abeta_in_iba1": positive_masks["abeta"] & positive_masks["iba1"],
-    }
+    intersections = {}
+    if {"cd68", "iba1"} <= positive_masks.keys():
+        intersections["cd68_in_iba1"] = positive_masks["cd68"] & positive_masks["iba1"]
+    if {"abeta", "cd68"} <= positive_masks.keys():
+        intersections["abeta_in_cd68"] = positive_masks["abeta"] & positive_masks["cd68"]
+    if {"abeta", "iba1"} <= positive_masks.keys():
+        intersections["abeta_in_iba1"] = positive_masks["abeta"] & positive_masks["iba1"]
     for name, intersection in intersections.items():
         count = int((region_mask & intersection).sum())
         result[f"{name}_area_um2"] = count * pixel_area_um2
-    iba1_area = result["iba1_positive_area_um2"]
-    cd68_area = result["cd68_positive_area_um2"]
-    abeta_area = result["abeta_positive_area_um2"]
-    result["cd68_in_iba1_fraction_of_iba1"] = _safe_ratio(
-        result["cd68_in_iba1_area_um2"], iba1_area
-    )
-    result["abeta_in_cd68_fraction_of_cd68"] = _safe_ratio(
-        result["abeta_in_cd68_area_um2"], cd68_area
-    )
-    result["abeta_in_cd68_fraction_of_abeta"] = _safe_ratio(
-        result["abeta_in_cd68_area_um2"], abeta_area
-    )
-    result["abeta_in_iba1_fraction_of_iba1"] = _safe_ratio(
-        result["abeta_in_iba1_area_um2"], iba1_area
-    )
-    result["abeta_in_iba1_fraction_of_abeta"] = _safe_ratio(
-        result["abeta_in_iba1_area_um2"], abeta_area
-    )
+    if "cd68_in_iba1" in intersections:
+        result["cd68_in_iba1_fraction_of_iba1"] = _safe_ratio(
+            result["cd68_in_iba1_area_um2"], result["iba1_positive_area_um2"]
+        )
+    if "abeta_in_cd68" in intersections:
+        result["abeta_in_cd68_fraction_of_cd68"] = _safe_ratio(
+            result["abeta_in_cd68_area_um2"], result["cd68_positive_area_um2"]
+        )
+        result["abeta_in_cd68_fraction_of_abeta"] = _safe_ratio(
+            result["abeta_in_cd68_area_um2"], result["abeta_positive_area_um2"]
+        )
+    if "abeta_in_iba1" in intersections:
+        result["abeta_in_iba1_fraction_of_iba1"] = _safe_ratio(
+            result["abeta_in_iba1_area_um2"], result["iba1_positive_area_um2"]
+        )
+        result["abeta_in_iba1_fraction_of_abeta"] = _safe_ratio(
+            result["abeta_in_iba1_area_um2"], result["abeta_positive_area_um2"]
+        )
     return result
 
 
@@ -1050,17 +1095,16 @@ def analyze_arrays(
     pixel_size_um_y: float,
     source_file: str = "",
 ) -> AnalysisProducts:
-    """Analyze Aβ, Iba1, CD68, and optional DAPI 2-D arrays."""
+    """Analyze one or more configured 2-D fluorescence channels."""
 
-    required = {"abeta", "iba1", "cd68"}
-    allowed = required | {"dapi"}
-    if not required.issubset(images) or not set(images).issubset(allowed):
-        raise ValueError(
-            f"images must contain {sorted(required)} and may additionally contain dapi"
-        )
+    if not images:
+        raise ValueError("images must contain at least one configured channel")
+    unknown = set(images) - set(config["channels"])
+    if unknown:
+        raise ValueError(f"images contain unknown configured channels: {sorted(unknown)}")
     shapes = {np.asarray(value).shape for value in images.values()}
     if len(shapes) != 1:
-        raise ValueError("Channels 1, 2, and 3 must have identical shapes.")
+        raise ValueError("All enabled channels must have identical shapes.")
     shape = next(iter(shapes))
     if len(shape) != 2:
         raise ValueError("Brain-section analysis expects 2-D arrays or projections.")
@@ -1071,18 +1115,22 @@ def analyze_arrays(
     pixel_area_um2 = pixel_size_um_x * pixel_size_um_y
 
     tissue = _tissue_mask(config, shape)
-    raw_images, positive_masks, thresholds = _threshold_channels(images, config, tissue)
+    stages = {"stage_tissue": ("mask", tissue, None)}
+    raw_images, positive_masks, thresholds = _threshold_channels(images, config, tissue, stages)
+    neighbour_enabled = config.get("advanced", {}).get("neighbour_enabled", True)
 
     # Every enabled channel is filtered independently after thresholding.
     marker_labels: dict[str, np.ndarray] = {}
     marker_tables: list[pd.DataFrame] = []
-    for role in (role for role in ("abeta", "iba1", "cd68", "dapi") if role in positive_masks):
+    for position, role in enumerate(positive_masks, 1):
         filtered_mask, labels, table = _filter_marker_components(
             positive_masks[role],
             config["channels"][role].get("object_filter", {}),
             pixel_area_um2,
             role,
+            channel_position=position,
             intensity_image=raw_images[role],
+            stages=stages,
         )
         positive_masks[role] = filtered_mask
         marker_labels[role] = labels
@@ -1090,22 +1138,24 @@ def analyze_arrays(
         marker_tables.append(table)
     marker_component_qc = pd.concat(marker_tables, ignore_index=True, sort=False)
 
-    reference_role = config["plaque"].get("reference_channel", "abeta")
+    reference_role = config["plaque"].get("reference_channel", "abeta") if neighbour_enabled else next(iter(marker_labels))
     reference_detection_image = preprocess_channel(
         images[reference_role], config["channels"][reference_role]
     ).analysis_image
     plaque_mask, plaque_labels, neuron_like_mask, candidate_qc = _segment_plaque_candidates(
-        positive_masks[reference_role],
+        positive_masks[reference_role] if neighbour_enabled else np.zeros(shape, dtype=bool),
         config,
         pixel_area_um2,
         intensity_image=raw_images[reference_role],
-        detection_image=reference_detection_image,
+        detection_image=reference_detection_image if neighbour_enabled else None,
         abeta_threshold=thresholds[reference_role],
         domain_mask=tissue,
+        stages=stages if neighbour_enabled else None,
     )
-    positive_masks[reference_role] = plaque_mask
+    if neighbour_enabled:
+        positive_masks[reference_role] = plaque_mask
 
-    edges = config["spatial"]["ring_edges_um"]
+    edges = config["spatial"]["ring_edges_um"] if neighbour_enabled else []
     distance, nearest_labels, ring_masks = _plaque_spatial_maps(
         plaque_mask,
         plaque_labels,
@@ -1151,12 +1201,13 @@ def analyze_arrays(
             plaque_distance_um=distance,
             nearest_plaque_labels=nearest_labels,
             ring_edges_um=edges,
+            stages=stages,
         )
         microglia_cells.insert(0, "source_file", source_file)
 
     plaque_count_before_microglia_filter = int(plaque_labels.max())
     microglia_absent_plaque_mask = np.zeros(shape, dtype=bool)
-    require_nearby_microglia = bool(
+    require_nearby_microglia = neighbour_enabled and bool(
         config["plaque"].get("require_nearby_microglia", False)
     )
     nearby_radius_um = float(
@@ -1421,7 +1472,29 @@ def analyze_arrays(
     else:
         summary["median_interior_plaque_area_um2"] = float("nan")
         summary["mean_interior_plaque_area_um2"] = float("nan")
+    advanced_metrics, object_distances, advanced_maps = pd.DataFrame(), pd.DataFrame(), {}
+    feature_tables = {}
+    if "advanced" in config:
+        scope = config["advanced"]["scope"]
+        domain = tissue & ((microglia_labels > 0) if scope == "cells" else (plaque_labels > 0) if scope == "reference_objects" else tissue)
+        advanced_metrics, object_distances, advanced_maps = analyze_relationships(
+            raw_images, marker_labels, domain, config, pixel_size_um_x, pixel_size_um_y, source_file, thresholds)
+        feature_tables, feature_maps, feature_summary = analyze_features(
+            raw_images, marker_labels, microglia_labels, domain, config, pixel_size_um_x, pixel_size_um_y, source_file)
+        advanced_maps.update(feature_maps)
+        summaries = [table for table in (advanced_metrics, feature_summary) if not table.empty]
+        advanced_metrics = pd.concat(summaries, ignore_index=True, sort=False) if summaries else pd.DataFrame()
+    if neighbour_enabled:
+        stages["stage_reference_final"] = ("labels", plaque_labels, reference_role)
+        stages["stage_reference_distance_um"] = ("heatmap", np.where(tissue, distance, np.nan), reference_role)
+    summary["neighbour_analysis_enabled"] = neighbour_enabled
     return AnalysisProducts(
+        neighbour_enabled=neighbour_enabled,
+        stages=stages,
+        advanced_maps=advanced_maps,
+        advanced_metrics=advanced_metrics,
+        object_distances=object_distances,
+        feature_tables=feature_tables,
         image_summary=pd.DataFrame([summary]),
         plaque_measurements=plaques,
         abeta_candidate_qc=candidate_qc,
@@ -1438,227 +1511,6 @@ def analyze_arrays(
         ring_masks=ring_masks,
         thresholds=thresholds,
     )
-
-
-def _display_scale(image: np.ndarray) -> np.ndarray:
-    values = np.asarray(image, dtype=float)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return np.zeros(values.shape, dtype=float)
-    positive = finite[finite > 0]
-    basis = positive if positive.size else finite
-    low, high = np.percentile(basis, [1, 99.7])
-    if high <= low:
-        high = low + 1.0
-    return np.clip((values - low) / (high - low), 0, 1)
-
-
-def _tint(image: np.ndarray, color: tuple[float, float, float]) -> np.ndarray:
-    return np.clip(np.asarray(image)[..., None] * np.asarray(color), 0.0, 1.0)
-
-
-def _overlay(
-    image: np.ndarray,
-    boundary: np.ndarray,
-    color: tuple[float, float, float],
-    width_px: int = 1,
-) -> np.ndarray:
-    result = np.asarray(image).copy()
-    width_px = max(1, int(width_px))
-    if width_px > 1:
-        boundary = ndi.maximum_filter(boundary.astype(np.uint8), size=width_px) > 0
-    result[boundary] = color
-    return result
-
-
-def _selected_qc_panels(
-    panels: list[tuple[str, str, np.ndarray]], selected: list[str]
-) -> list[tuple[str, str, np.ndarray]]:
-    selected_names = set(selected)
-    return [panel for panel in panels if panel[0] in selected_names]
-
-
-def _save_qc(
-    path: Path | None,
-    raw_images: dict[str, np.ndarray],
-    products: AnalysisProducts,
-    max_dimension: int,
-    channel_colors: dict[str, tuple[float, float, float]],
-    channel_names: dict[str, str],
-    cell_count_config: dict[str, Any],
-    reference_role: str,
-    selected_qc_panels: list[str],
-    processing_dir: Path | None = None,
-    save_raw_channels: bool = True,
-    save_composite: bool = True,
-    save_segmentation: bool = True,
-    save_mask_images: bool = True,
-    ring_boundary_width_px: int = 1,
-) -> dict[str, str]:
-    shape = products.tissue_mask.shape
-    stride = max(1, int(math.ceil(max(shape) / max_dimension)))
-    sl = (slice(None, None, stride), slice(None, None, stride))
-    scaled = {role: _display_scale(image)[sl] for role, image in raw_images.items()}
-    tinted = {role: _tint(image, channel_colors[role]) for role, image in scaled.items()}
-    composite = np.clip(
-        sum((tinted[role] for role in tinted), np.zeros_like(next(iter(tinted.values())))),
-        0.0,
-        1.0,
-    )
-    labels = products.plaque_labels[sl]
-    neuron_like = products.neuron_like_mask[sl]
-    no_microglia = products.microglia_absent_plaque_mask[sl]
-    tissue = products.tissue_mask[sl]
-    plaque_boundaries = segmentation.find_boundaries(labels, mode="outer")
-    neuron_boundaries = segmentation.find_boundaries(neuron_like, mode="outer")
-    no_microglia_boundaries = segmentation.find_boundaries(no_microglia, mode="outer")
-    tissue_boundaries = segmentation.find_boundaries(tissue, mode="inner")
-    reference_overlay = _overlay(tinted[reference_role], plaque_boundaries, (0.0, 1.0, 1.0))
-    reference_overlay = _overlay(reference_overlay, neuron_boundaries, (1.0, 0.0, 1.0))
-    reference_overlay = _overlay(reference_overlay, no_microglia_boundaries, (1.0, 0.5, 0.0))
-    object_boundary_colors = {
-        "abeta": (0.0, 1.0, 1.0),
-        "iba1": (0.0, 1.0, 0.0),
-        "cd68": (1.0, 1.0, 0.0),
-        "dapi": (1.0, 1.0, 1.0),
-    }
-    object_overlays = {
-        role: _overlay(
-            tinted[role],
-            segmentation.find_boundaries(products.marker_labels[role][sl], mode="outer"),
-            object_boundary_colors[role],
-        )
-        for role in tinted
-    }
-    tissue_overlay = composite.copy()
-    tissue_overlay[~tissue] *= 0.15
-    tissue_overlay = _overlay(tissue_overlay, tissue_boundaries, (1.0, 0.0, 1.0))
-
-    panels: list[tuple[str, str, np.ndarray]] = [
-        ("05_composite", "Composite: selected channel colors", composite),
-        (
-            "06_primary_object_segmentation",
-            f"{channel_names[reference_role]}: reference objects cyan; excluded objects magenta; no-nearby-cell orange",
-            reference_overlay,
-        ),
-    ]
-    for index, role in enumerate(("abeta", "iba1", "cd68", "dapi"), start=1):
-        if role in object_overlays:
-            panels.append(
-                (
-                    f"07_channel_{index}_objects",
-                    f"{channel_names[role]}: accepted object-filter boundaries",
-                    object_overlays[role],
-                )
-            )
-
-    nucleus_role = cell_count_config.get("nucleus_channel")
-    confirmation_role = cell_count_config.get("confirmation_channel")
-    if bool(cell_count_config.get("enabled")) and nucleus_role in tinted:
-        nucleus_boundary = segmentation.find_boundaries(products.nucleus_labels[sl], mode="outer")
-        cell_boundary = segmentation.find_boundaries(products.microglia_labels[sl], mode="outer")
-        cell_overlay = _overlay(tinted[nucleus_role], nucleus_boundary, (1.0, 1.0, 1.0))
-        cell_overlay = _overlay(cell_overlay, cell_boundary, (1.0, 1.0, 0.0))
-        confirmation_text = (
-            f"; {channel_names[confirmation_role]}-confirmed cells yellow"
-            if confirmation_role
-            else "; accepted cells yellow"
-        )
-        panels.append(
-            (
-                "09_cell_counting",
-                f"{channel_names[nucleus_role]} nuclei white{confirmation_text}",
-                cell_overlay,
-            )
-        )
-    if products.ring_masks:
-        ring_union = np.zeros(labels.shape, dtype=bool)
-        for mask in products.ring_masks.values():
-            ring_union |= mask[sl]
-        ring_overlay = _overlay(
-            composite,
-            segmentation.find_boundaries(ring_union, mode="outer"),
-            (1.0, 1.0, 0.0),
-            width_px=ring_boundary_width_px,
-        )
-        panels.append(
-            ("10_primary_object_distance_rings", "Neighbour distance-ring boundaries yellow", ring_overlay)
-        )
-    panels.append(("11_tissue_roi", "Tissue ROI boundary magenta", tissue_overlay))
-    processing_panels = panels
-    panels = _selected_qc_panels(panels, selected_qc_panels)
-
-    saved: dict[str, str] = {}
-    if path is not None:
-        if not panels:
-            raise ValueError(
-                "None of the selected Overview QC panels are available for this image."
-            )
-        columns = min(4, len(panels))
-        rows = int(math.ceil(len(panels) / columns))
-        figure, axes = plt.subplots(rows, columns, figsize=(18, 4.5 * rows), squeeze=False)
-        for axis, (_, title, panel) in zip(axes.ravel(), panels):
-            axis.imshow(panel)
-            axis.set_title(title, fontsize=10)
-            axis.axis("off")
-        for axis in axes.ravel()[len(panels):]:
-            axis.axis("off")
-        figure.tight_layout()
-        figure.savefig(path, dpi=160, bbox_inches="tight")
-        plt.close(figure)
-        saved["qc"] = str(path)
-
-    if processing_dir is not None:
-        processing_dir.mkdir(parents=True, exist_ok=True)
-        if save_raw_channels:
-            for index, role in enumerate(("abeta", "iba1", "cd68", "dapi"), start=1):
-                if role not in tinted:
-                    continue
-                filename = processing_dir / f"{index:02d}_raw_channel_{index}.png"
-                plt.imsave(filename, tinted[role])
-                saved[f"processing_raw_{role}"] = str(filename)
-        for name, _, panel in processing_panels:
-            if name == "05_composite" and not save_composite:
-                continue
-            if name != "05_composite" and not save_segmentation:
-                continue
-            filename = processing_dir / f"{name}.png"
-            plt.imsave(filename, panel)
-            saved[f"processing_{name}"] = str(filename)
-        if save_mask_images:
-            mask_images = {
-                "neighbour_reference_object_mask": _tint(
-                    products.positive_masks[reference_role][sl].astype(float), channel_colors[reference_role]
-                ),
-                "neighbour_excluded_object_mask": _tint(
-                    products.neuron_like_mask[sl].astype(float), (1.0, 0.0, 1.0)
-                ),
-                "neighbour_no_nearby_cell_excluded": _tint(
-                    products.microglia_absent_plaque_mask[sl].astype(float), (1.0, 0.5, 0.0)
-                ),
-            }
-            for index, role in enumerate(("abeta", "iba1", "cd68", "dapi"), start=1):
-                if role in products.marker_labels:
-                    mask_images[f"channel_{index}_object_filter_mask"] = _tint(
-                        (products.marker_labels[role][sl] > 0).astype(float), channel_colors[role]
-                    )
-            if bool(cell_count_config.get("enabled")) and nucleus_role in channel_colors:
-                mask_images["nucleus_mask"] = _tint(
-                    (products.nucleus_labels[sl] > 0).astype(float), channel_colors[nucleus_role]
-                )
-                mask_images["cell_mask"] = _tint(
-                    (products.microglia_labels[sl] > 0).astype(float), (1.0, 1.0, 0.0)
-                )
-            for name, image in mask_images.items():
-                filename = processing_dir / f"mask_{name}.png"
-                plt.imsave(filename, image)
-                saved[f"processing_mask_{name}"] = str(filename)
-            for name, mask in products.ring_masks.items():
-                filename = processing_dir / f"mask_{name}.png"
-                plt.imsave(filename, mask[sl].astype(float), cmap="gray", vmin=0, vmax=1)
-                saved[f"processing_mask_{name}"] = str(filename)
-        saved["processing_images_dir"] = str(processing_dir)
-    return saved
 
 
 def _channel_colors(
@@ -1687,7 +1539,7 @@ def _channel_colors(
                 for offset in (0, 2, 4)
             )
         except (TypeError, ValueError):
-            result[role] = defaults[role]
+            result[role] = defaults.get(role, (1.0, 1.0, 1.0))
     return result
 
 
@@ -1733,6 +1585,11 @@ def _write_outputs(
         "ring_metrics": public_ring_table,
         "thresholds": threshold_table,
     }
+    if not products.advanced_metrics.empty:
+        tables["advanced_metrics"] = products.advanced_metrics
+        if config["advanced"]["object_distances_enabled"]:
+            tables["object_distances"] = products.object_distances
+    tables.update(products.feature_tables)
     selected_tables = {
         name: _select_output_columns(table, config, name)
         for name, table in tables.items()
@@ -1746,19 +1603,30 @@ def _write_outputs(
         ("save_cells_csv", "microglia_cells_csv", microglia_csv, selected_tables["cells"]),
         ("save_ring_metrics_csv", "plaque_ring_metrics_csv", ring_csv, selected_tables["ring_metrics"]),
     )
+    for name, (_, flag) in ADVANCED_TABLES.items():
+        if name in selected_tables:
+            table_outputs += ((flag, f"{name}_csv", output_dir / f"{name}.csv", selected_tables[name]),)
     for flag, key, table_path, table in table_outputs:
+        if not products.neighbour_enabled and flag in {"save_primary_objects_csv", "save_candidate_qc_csv", "save_ring_metrics_csv"}:
+            continue
         if bool(config["output"].get(flag, True)):
             table.to_csv(table_path, index=False)
             paths[key] = str(table_path)
     if bool(config["output"].get("save_excel", True)):
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             selected_tables["image_summary"].to_excel(writer, sheet_name="Image Summary", index=False)
-            selected_tables["primary_objects"].to_excel(writer, sheet_name="Neighbour Objects", index=False)
-            selected_tables["candidate_qc"].to_excel(writer, sheet_name="Neighbour QC", index=False)
+            if products.neighbour_enabled:
+                selected_tables["primary_objects"].to_excel(writer, sheet_name="Neighbour Objects", index=False)
+            if products.neighbour_enabled:
+                selected_tables["candidate_qc"].to_excel(writer, sheet_name="Neighbour QC", index=False)
             selected_tables["channel_objects"].to_excel(writer, sheet_name="Channel Objects", index=False)
             selected_tables["cells"].to_excel(writer, sheet_name="Cells", index=False)
-            selected_tables["ring_metrics"].to_excel(writer, sheet_name="Object Ring Metrics", index=False)
+            if products.neighbour_enabled:
+                selected_tables["ring_metrics"].to_excel(writer, sheet_name="Object Ring Metrics", index=False)
             selected_tables["thresholds"].to_excel(writer, sheet_name="Thresholds", index=False)
+            for name, (title, _) in ADVANCED_TABLES.items():
+                if name in selected_tables:
+                    selected_tables[name].to_excel(writer, sheet_name=title, index=False)
         paths["excel"] = str(excel_path)
 
     config_path = output_dir / "config_used.yaml"
@@ -1778,13 +1646,13 @@ def _write_outputs(
             tissue_path, products.tissue_mask.astype(np.uint8), compression="zlib"
         )
         paths["tissue_mask"] = str(tissue_path)
-    if bool(output.get("save_primary_object_labels", True)):
+    if products.neighbour_enabled and bool(output.get("save_primary_object_labels", True)):
         labels_path = output_dir / "neighbour_reference_labels.tiff"
         tifffile.imwrite(
             labels_path, products.plaque_labels.astype(np.uint32), compression="zlib"
         )
         paths["plaque_labels"] = str(labels_path)
-    if bool(output.get("save_excluded_object_masks", True)):
+    if products.neighbour_enabled and bool(output.get("save_excluded_object_masks", True)):
         neuron_path = output_dir / "neighbour_excluded_objects.tiff"
         no_microglia_path = output_dir / "neighbour_no_nearby_cell_excluded.tiff"
         tifffile.imwrite(
@@ -1841,11 +1709,7 @@ def _write_outputs(
         )
     if bool(output.get("save_positive_masks", True)):
         channels_path = output_dir / "positive_masks.tiff"
-        mask_roles = [
-            role
-            for role in ("abeta", "iba1", "cd68", "dapi")
-            if role in products.positive_masks
-        ]
+        mask_roles = list(products.positive_masks)
         tifffile.imwrite(
             channels_path,
             np.stack(
@@ -1867,6 +1731,8 @@ def _write_outputs(
         "save_composite": bool(output.get("save_composite_image", True)),
         "save_segmentation": bool(output.get("save_segmentation_images", True)),
         "save_mask_images": bool(output.get("save_mask_images", True)),
+        "save_stages": bool(output.get("save_stage_images", True)),
+        "save_advanced": bool(output.get("save_advanced_images", True)),
     }
     save_processing = any(processing_flags.values())
     if save_qc or save_processing:
@@ -1883,11 +1749,13 @@ def _write_outputs(
                 channel_colors,
                 channel_names,
                 config["microglia_count"],
-                config["plaque"].get("reference_channel", "abeta"),
+                config["plaque"].get("reference_channel", "abeta") if products.neighbour_enabled else next(iter(raw_images)),
                 list(output.get("qc_panels", [])),
                 output_dir / "processing_images" if save_processing else None,
                 **processing_flags,
                 ring_boundary_width_px=int(output.get("ring_boundary_width_px", 1)),
+                drawing=output.get("drawing"),
+                processing_steps=output.get("processing_steps"),
             )
         )
     return paths, tables
@@ -1918,9 +1786,10 @@ def run_analysis(
     )
     config = normalize_config(raw_config, info)
     input_config = config["input"]
-    roles = ["abeta", "iba1", "cd68"]
-    if bool(config["channels"]["dapi"].get("enabled", False)):
-        roles.append("dapi")
+    roles = [
+        role for role, item in config["channels"].items()
+        if bool(item.get("enabled", True))
+    ]
     role_indices = {role: int(config["channels"][role]["index"]) for role in roles}
     _notify(progress, "Reading configured fluorescence channels...")
     by_index = read_image_channels(
@@ -1940,7 +1809,7 @@ def run_analysis(
         raise ValueError("Physical X/Y pixel calibration is required for cell analysis.")
     effective_x = float(pixel_x) / input_config["zoom"]
     effective_y = float(pixel_y) / input_config["zoom"]
-    _notify(progress, "Running neighbour analysis and measuring distance rings...")
+    _notify(progress, "Segmenting channels and running selected advanced analyses...")
     products = analyze_arrays(
         images,
         config,
@@ -1964,5 +1833,6 @@ def run_analysis(
     summary_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     if include_tables:
         result["_tables"] = tables
+        result["_render_context"] = {"products": products, "images": images, "info": info, "config": config}
     _notify(progress, f"Complete: {result['plaque_count_all']} reference objects detected.")
     return result

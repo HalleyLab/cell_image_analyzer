@@ -14,6 +14,7 @@ import pandas as pd
 from cell_analyzer.image_io import SUPPORTED_IMAGE_SUFFIXES
 
 from .analysis import _export_table, _select_output_columns, run_analysis
+from .advanced_features import ADVANCED_TABLES
 from .config import load_config, save_config
 
 
@@ -239,6 +240,7 @@ def run_batch_analysis(
     marker_tables: list[pd.DataFrame] = []
     microglia_tables: list[pd.DataFrame] = []
     ring_tables: list[pd.DataFrame] = []
+    advanced_tables = {name: [] for name in ADVANCED_TABLES}
     used_names: dict[str, int] = {}
     for index, path in enumerate(paths, start=1):
         base = _safe_name(path)
@@ -262,6 +264,13 @@ def run_batch_analysis(
                 include_tables=True,
             )
             tables = result.pop("_tables")
+            result.pop("_render_context", None)
+            for name, collected in advanced_tables.items():
+                if name in tables:
+                    table = tables[name].copy()
+                    table.insert(0, "batch_file_index", index)
+                    table.insert(1, "source_name", path.name)
+                    collected.append(table)
             image_table = _export_table(tables["image_summary"], file_config, reverse=True)
             plaque_table = _export_table(tables["primary_objects"], file_config, reverse=True)
             candidate_table = _export_table(tables["candidate_qc"], file_config, reverse=True)
@@ -412,20 +421,38 @@ def run_batch_analysis(
         ("save_ring_metrics_csv", "combined_plaque_ring_metrics", ring_path, public_rings),
         ("save_animal_summary_csv", "animal_summary", animal_path, public_animals),
     )
+    has_neighbour = bool(combined_images.get("neighbour_analysis_enabled", pd.Series(dtype=bool)).any())
     for flag, key, path, table in combined_outputs:
+        if not has_neighbour and flag in {"save_primary_objects_csv", "save_candidate_qc_csv", "save_ring_metrics_csv"}:
+            continue
         if bool(output.get(flag, True)):
             table.to_csv(path, index=False)
             result_files[key] = str(path)
+    public_advanced = {
+        name: _select_output_columns(pd.concat(collected, ignore_index=True, sort=False), template, name)
+        for name, collected in advanced_tables.items() if collected
+    }
+    for name, table in public_advanced.items():
+        flag = ADVANCED_TABLES[name][1]
+        if output.get(flag, True):
+            destination = root / f"combined_{name}.csv"
+            table.to_csv(destination, index=False)
+            result_files[name] = str(destination)
     if bool(output.get("save_excel", True)):
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             public_batch_summary.to_excel(writer, sheet_name="Batch Summary", index=False)
             public_images.to_excel(writer, sheet_name="Image Summary", index=False)
-            public_objects.to_excel(writer, sheet_name="Neighbour Objects", index=False)
-            public_candidates.to_excel(writer, sheet_name="Neighbour QC", index=False)
+            if has_neighbour:
+                public_objects.to_excel(writer, sheet_name="Neighbour Objects", index=False)
+            if has_neighbour:
+                public_candidates.to_excel(writer, sheet_name="Neighbour QC", index=False)
             public_channels.to_excel(writer, sheet_name="Channel Objects", index=False)
             public_cells.to_excel(writer, sheet_name="Cells", index=False)
-            public_rings.to_excel(writer, sheet_name="Object Ring Metrics", index=False)
+            if has_neighbour:
+                public_rings.to_excel(writer, sheet_name="Object Ring Metrics", index=False)
             public_animals.to_excel(writer, sheet_name="Animal Summary", index=False)
+            for name, table in public_advanced.items():
+                table.to_excel(writer, sheet_name=ADVANCED_TABLES[name][0], index=False)
         result_files["excel"] = str(excel_path)
     result = {
         "output_root": str(root),

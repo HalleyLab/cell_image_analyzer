@@ -33,3 +33,6 @@ cell-fluorescence-analyzer-gui = "brain_section_analyzer.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["cell_analyzer*", "brain_section_analyzer*"]
+
+[tool.pytest.ini_options]
+cache_dir = "local_artifacts/cache/pytest"

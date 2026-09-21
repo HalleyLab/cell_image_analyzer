@@ -23,22 +23,28 @@ from cell_analyzer.image_io import (
     inspect_image,
 )
 
-from .analysis import run_analysis
+from .analysis import run_analysis, _channel_colors
+from .advanced import DRAWING_DEFAULTS, ROLES, STAGE_LABELS, roles_for_count
+from .advanced_features import ADVANCED_TABLES, FEATURE_DEFAULTS, FEATURE_IMAGES
+from .plots import save_qc
 from .batch import _resolve_mask, run_batch_analysis
 from .config import (
     DEFAULT_CONFIG,
     OUTPUT_SELECTION_DEFAULTS,
     QC_PANEL_DEFAULTS,
+    QC_PANEL_CHOICES,
+    PROCESSING_CHOICES,
+    default_channel,
     load_config,
     normalize_config,
+    processing_choices,
+    qc_panel_choices,
     save_config,
 )
 
 
-ROLES = ("abeta", "iba1", "cd68", "dapi")
 ROLE_LABELS = dict(zip(ROLES, ("Channel 1", "Channel 2", "Channel 3", "Channel 4")))
 ROLE_BY_LABEL = {label: role for role, label in ROLE_LABELS.items()}
-CELL_CHANNEL_CHOICES = ("", *ROLE_LABELS.values())
 THRESHOLD_METHODS = ("manual", "otsu", "yen", "triangle", "percentile")
 PREVIEW_IMAGE_OUTPUT_KEYS = (
     "save_qc",
@@ -46,6 +52,8 @@ PREVIEW_IMAGE_OUTPUT_KEYS = (
     "save_composite_image",
     "save_segmentation_images",
     "save_mask_images",
+    "save_stage_images",
+    "save_advanced_images",
 )
 QC_PANEL_LABELS = {
     "05_composite": "Composite",
@@ -58,6 +66,10 @@ QC_PANEL_LABELS = {
     "10_primary_object_distance_rings": "Distance rings",
     "11_tissue_roi": "Tissue ROI",
 }
+QC_PANEL_LABELS.update(STAGE_LABELS)
+QC_PANEL_LABELS.update(FEATURE_IMAGES)
+QC_PANEL_LABELS.update({f"raw_channel_{i}": f"Channel {i}: raw image" for i in range(1, 5)})
+
 TABLE_FILE_OUTPUT_KEYS = {
     "save_excel",
     "save_image_summary_csv",
@@ -67,6 +79,8 @@ TABLE_FILE_OUTPUT_KEYS = {
     "save_cells_csv",
     "save_ring_metrics_csv",
     "save_animal_summary_csv",
+    "save_advanced_metrics_csv",
+    "save_object_distances_csv",
 }
 OUTPUT_TABLE_LABELS = {
     "batch_summary": "Batch Summary",
@@ -78,7 +92,11 @@ OUTPUT_TABLE_LABELS = {
     "ring_metrics": "Neighbour Ring Metrics",
     "animal_summary": "Animal Summary",
     "thresholds": "Thresholds (per-image Excel)",
+    "advanced_metrics": "Advanced Metrics",
+    "object_distances": "Object Distances",
 }
+OUTPUT_TABLE_LABELS.update({name: title for name, (title, _) in ADVANCED_TABLES.items()})
+TABLE_FILE_OUTPUT_KEYS.update(flag for _, flag in ADVANCED_TABLES.values())
 BATCH_SUMMARY_COLUMNS = (
     "batch_file_index",
     "source_file",
@@ -116,12 +134,18 @@ class BrainSectionGui:
         self.root.geometry("1380x980")
         self.image_paths: list[Path] = []
         self.info = None
+        self.active_roles = list(roles_for_count(4))
+        ROLE_LABELS.clear()
+        ROLE_LABELS.update({role: f"Channel {index}" for index, role in enumerate(self.active_roles, 1)})
+        ROLE_BY_LABEL.clear()
+        ROLE_BY_LABEL.update({label: role for role, label in ROLE_LABELS.items()})
         self.messages: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.channel_vars: dict[str, dict[str, tk.Variable]] = {}
         self.marker_vars: dict[str, dict[str, tk.Variable]] = {}
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_path: Path | None = None
         self.preview_files: dict[str, Path] = {}
+        self.preview_context = None
         self.available_output_columns: dict[str, list[str]] = {}
         self.selected_output_columns: dict[str, list[str]] = {}
         self._build()
@@ -136,22 +160,27 @@ class BrainSectionGui:
         fields: list[tuple[str, str, tuple[str, ...] | None]],
         *,
         column: int = 0,
-    ) -> None:
+    ) -> dict[str, ttk.Widget]:
+        widgets: dict[str, ttk.Widget] = {}
         for row, (label, key, choices) in enumerate(fields):
             variable = variables[key]
             if isinstance(variable, tk.BooleanVar):
-                ttk.Checkbutton(parent, text=label, variable=variable).grid(
+                widget = ttk.Checkbutton(parent, text=label, variable=variable)
+                widget.grid(
                     row=row, column=column, columnspan=2, sticky="w", padx=5, pady=3
                 )
+                widgets[key] = widget
                 continue
-            ttk.Label(parent, text=label).grid(row=row, column=column, sticky="w", padx=5, pady=3)
+            ttk.Label(parent, text=label, wraplength=210).grid(row=row, column=column, sticky="w", padx=5, pady=3)
             if choices:
                 widget = ttk.Combobox(
                     parent, textvariable=variable, values=choices, state="readonly", width=24
                 )
             else:
-                widget = ttk.Entry(parent, textvariable=variable, width=26)
+                widget = ttk.Entry(parent, textvariable=variable, width=20)
             widget.grid(row=row, column=column + 1, sticky="ew", padx=5, pady=3)
+            widgets[key] = widget
+        return widgets
 
     def _build(self) -> None:
         outer = ttk.Frame(self.root, padding=10)
@@ -203,13 +232,14 @@ class BrainSectionGui:
         output_tab = ttk.Frame(notebook, padding=8)
         notebook.add(input_tab, text="Image & ROI")
         notebook.add(channels_tab, text="Channels")
-        notebook.add(plaque_tab, text="Neighbour Analysis")
         notebook.add(microglia_tab, text="Cell Counting")
+        notebook.add(plaque_tab, text="Advanced Analysis")
         notebook.add(output_tab, text="Outputs")
         self.output_tab = output_tab
+        self.channels_tab = channels_tab
         self._build_input_tab(input_tab)
         self._build_channels_tab(channels_tab)
-        self._build_plaque_tab(plaque_tab)
+        self._build_advanced_tab(plaque_tab)
         self._build_microglia_tab(microglia_tab)
         self._build_output_tab(output_tab)
 
@@ -312,14 +342,16 @@ class BrainSectionGui:
             variable.set(selected.upper())
 
     def _build_channels_tab(self, parent: ttk.Frame) -> None:
+        self.channel_vars = {}
+        self.marker_vars = {}
         headers = (
             "Channel", "Enabled", "Image channel", "Name", "Wavelength nm", "Color",
             "Gaussian σ", "Threshold method", "Manual value", "Auto scale", "Percentile",
         )
         for column, label in enumerate(headers):
             ttk.Label(parent, text=label).grid(row=0, column=column, sticky="w", padx=3, pady=4)
-        for row, role in enumerate(ROLES, start=1):
-            defaults = DEFAULT_CONFIG["channels"][role]
+        for row, role in enumerate(self.active_roles, start=1):
+            defaults = default_channel(role, row - 1)
             variables: dict[str, tk.Variable] = {
                 "enabled": tk.BooleanVar(value=role != "dapi"),
                 "index": tk.StringVar(value=str(row - 1)),
@@ -336,8 +368,6 @@ class BrainSectionGui:
             ttk.Label(parent, text=ROLE_LABELS[role]).grid(row=row, column=0, sticky="w", padx=3)
             check = ttk.Checkbutton(parent, variable=variables["enabled"])
             check.grid(row=row, column=1)
-            if role != "dapi":
-                check.state(["disabled"])
             variables["index_widget"] = ttk.Combobox(
                 parent, textvariable=variables["index"], state="readonly", width=18
             )
@@ -354,13 +384,14 @@ class BrainSectionGui:
             ttk.Entry(parent, textvariable=variables["scale"], width=8).grid(row=row, column=9, padx=3)
             ttk.Entry(parent, textvariable=variables["percentile"], width=8).grid(row=row, column=10, padx=3)
 
-        ttk.Label(parent, text="These channel settings are applied to every selected file.").grid(row=5, column=0, columnspan=11, sticky="w", padx=4, pady=(4, 0))
+        footer_row = len(self.active_roles) + 1
+        ttk.Label(parent, text="These channel settings are applied to every selected file.").grid(row=footer_row, column=0, columnspan=11, sticky="w", padx=4, pady=(4, 0))
         filter_group = ttk.LabelFrame(parent, text="Object filter", padding=8)
-        filter_group.grid(row=6, column=0, columnspan=11, sticky="nsew", padx=5, pady=12)
+        filter_group.grid(row=footer_row + 1, column=0, columnspan=11, sticky="nsew", padx=5, pady=12)
         selector = ttk.Frame(filter_group)
         selector.grid(row=0, column=0, sticky="w")
         ttk.Label(selector, text="Channel").pack(side="left")
-        self.object_filter_channel = tk.StringVar(value=ROLE_LABELS[ROLES[0]])
+        self.object_filter_channel = tk.StringVar(value=ROLE_LABELS[self.active_roles[0]])
         object_filter_selector = ttk.Combobox(
             selector,
             textvariable=self.object_filter_channel,
@@ -373,8 +404,8 @@ class BrainSectionGui:
         container = ttk.Frame(filter_group)
         container.grid(row=1, column=0, sticky="nsew")
         self.object_filter_frames: dict[str, ttk.Frame] = {}
-        for role in ROLES:
-            defaults = DEFAULT_CONFIG["channels"][role]["object_filter"]
+        for role in self.active_roles:
+            defaults = default_channel(role, self.active_roles.index(role))["object_filter"]
             variables = {
                 "enabled": tk.BooleanVar(value=defaults["enabled"]),
                 "opening_radius_px": tk.StringVar(value=str(defaults["opening_radius_px"])),
@@ -412,6 +443,305 @@ class BrainSectionGui:
     def _show_object_filter_channel(self, _event: Any = None) -> None:
         role = ROLE_BY_LABEL[self.object_filter_channel.get()]
         self.object_filter_frames[role].tkraise()
+
+    def _set_channel_count(self, count: int) -> None:
+        """Rebuild channel-dependent controls from the inspected image metadata."""
+
+        roles = list(roles_for_count(count))
+        if not roles:
+            raise ValueError("The selected image has no readable channels.")
+        channel_state = {
+            role: {key: value.get() for key, value in variables.items() if isinstance(value, tk.Variable)}
+            for role, variables in self.channel_vars.items()
+        }
+        marker_state = {
+            role: {key: value.get() for key, value in variables.items()}
+            for role, variables in self.marker_vars.items()
+        }
+        self.active_roles = roles
+        ROLE_LABELS.clear()
+        ROLE_LABELS.update({role: f"Channel {index}" for index, role in enumerate(roles, 1)})
+        ROLE_BY_LABEL.clear()
+        ROLE_BY_LABEL.update({label: role for role, label in ROLE_LABELS.items()})
+        for child in self.channels_tab.winfo_children():
+            child.destroy()
+        self._build_channels_tab(self.channels_tab)
+        for role in roles:
+            for key, value in channel_state.get(role, {}).items():
+                if key in self.channel_vars[role]:
+                    self.channel_vars[role][key].set(value)
+            for key, value in marker_state.get(role, {}).items():
+                self.marker_vars[role][key].set(value)
+        self._refresh_channel_dependent_controls()
+
+    def _refresh_channel_dependent_controls(self) -> None:
+        labels = tuple(ROLE_LABELS.values())
+        for widget in getattr(self, "pair_selectors", []):
+            widget.configure(values=labels)
+        if hasattr(self, "radial_reference_widget"):
+            self.radial_reference_widget.configure(values=labels)
+        for widget in getattr(self, "plaque_channel_widgets", []):
+            widget.configure(values=labels)
+        for widget in getattr(self, "cell_channel_widgets", []):
+            widget.configure(values=("", *labels))
+        for variable in (
+            getattr(self, "pair_a", None), getattr(self, "pair_b", None),
+            getattr(self, "radial_reference_selector", None),
+            getattr(self, "plaque_vars", {}).get("reference_channel"),
+        ):
+            if variable is not None and variable.get() not in labels:
+                variable.set(labels[0])
+        for key in ("nucleus_channel", "confirmation_channel"):
+            variable = getattr(self, "microglia_vars", {}).get(key)
+            if variable is not None and variable.get() not in ("", *labels):
+                variable.set("")
+        self.advanced_pairs = [
+            pair for pair in getattr(self, "advanced_pairs", [])
+            if len(pair) == 2 and all(role in self.active_roles for role in pair)
+        ]
+        if hasattr(self, "pair_list"):
+            self._refresh_advanced_pairs()
+            self._rebuild_advanced_channel_controls()
+
+        if hasattr(self, "boundary_vars"):
+            old = self.boundary_vars
+            self.boundary_vars = {
+                role: old.get(role, {
+                    "color": tk.StringVar(value=self.channel_vars[role]["color"].get()),
+                    "width_px": tk.StringVar(value="1"),
+                })
+                for role in self.active_roles
+            }
+            self.boundary_vars.update({
+                name: variables for name, variables in old.items()
+                if name not in ROLES and not name.startswith("channel_")
+            })
+            self.boundary_vars["ring"]["width_px"] = self.output_vars["ring_boundary_width_px"]
+
+            old_processing = getattr(self, "processing_vars", {})
+            self.processing_choices = processing_choices(len(self.active_roles))
+            self.processing_vars = {
+                key: old_processing.get(key, tk.BooleanVar(value=True))
+                for key in self.processing_choices
+            }
+            old_qc = getattr(self, "qc_panel_vars", {})
+            choices = qc_panel_choices(len(self.active_roles))
+            self.qc_panel_labels = {
+                key: QC_PANEL_LABELS.get(key, self.processing_choices.get(key, key.replace("_", " ").title()))
+                for key in choices
+            }
+            self.qc_panel_vars = {
+                key: old_qc.get(key, tk.BooleanVar(value=True)) for key in choices
+            }
+            self._update_qc_panel_status()
+
+    def _build_advanced_tab(self, parent):
+        self.advanced_vars = {
+            **{key: (tk.BooleanVar(value=value) if isinstance(value, bool) else tk.StringVar(value=str(value)))
+               for key, value in FEATURE_DEFAULTS.items() if key not in {"object_channels", "radial_reference_channel"}},
+            "neighbour_enabled": tk.BooleanVar(value=False),
+            "colocalization_enabled": tk.BooleanVar(value=False),
+            "object_distances_enabled": tk.BooleanVar(value=False),
+            "scope": tk.StringVar(value="roi"), "proximity_um": tk.StringVar(value="10"),
+        }
+        self.background_vars = {role: tk.StringVar(value="0") for role in self.active_roles}
+        self.object_channel_vars = {role: tk.BooleanVar(value=role in FEATURE_DEFAULTS["object_channels"]) for role in self.active_roles}
+        self.radial_reference_selector = tk.StringVar(value="Channel 1")
+        self.advanced_pairs = []
+        switches = ttk.Frame(parent)
+        switches.pack(fill="x", pady=(0, 8))
+        for index, (label, key) in enumerate((("Neighbour analysis", "neighbour_enabled"),
+                           ("Colocalization", "colocalization_enabled"),
+                           ("Object distances (A -> B)", "object_distances_enabled"),
+                           ("Per-cell measurements", "cell_measurements_enabled"),
+                           ("Radial profiles", "radial_profiles_enabled"),
+                           ("Spatial distribution", "spatial_distribution_enabled"),
+                           ("Skeleton analysis", "skeleton_enabled"))):
+            ttk.Checkbutton(
+                switches, text=label, variable=self.advanced_vars[key],
+                command=self._update_advanced_visibility,
+            ).grid(row=index // 3, column=index % 3, sticky="w", padx=8, pady=3)
+
+        self.advanced_common = ttk.LabelFrame(parent, text="Shared scope", padding=6)
+        self._entry_grid(self.advanced_common, self.advanced_vars, [
+            ("Analysis scope", "scope", ("roi", "cells", "reference_objects")),
+        ])
+        self.advanced_empty = ttk.Label(
+            parent, text="Select an advanced analysis above to show its parameters."
+        )
+        self.advanced_notebook = ttk.Notebook(parent)
+        neighbour = ttk.Frame(self.advanced_notebook, padding=8)
+        relationships = ttk.Frame(self.advanced_notebook, padding=8)
+        cell_measurements = ttk.Frame(self.advanced_notebook, padding=8)
+        radial = ttk.Frame(self.advanced_notebook, padding=8)
+        spatial = ttk.Frame(self.advanced_notebook, padding=8)
+        skeleton = ttk.Frame(self.advanced_notebook, padding=8)
+        self.advanced_sections = (
+            (neighbour, "Neighbour settings", lambda: self.advanced_vars["neighbour_enabled"].get()),
+            (relationships, "Channel relationships", lambda: self.advanced_vars["colocalization_enabled"].get() or self.advanced_vars["object_distances_enabled"].get()),
+            (cell_measurements, "Per-cell measurements", lambda: self.advanced_vars["cell_measurements_enabled"].get()),
+            (radial, "Radial profiles", lambda: self.advanced_vars["radial_profiles_enabled"].get()),
+            (spatial, "Spatial distribution", lambda: self.advanced_vars["spatial_distribution_enabled"].get()),
+            (skeleton, "Skeleton analysis", lambda: self.advanced_vars["skeleton_enabled"].get()),
+        )
+        self._build_plaque_tab(neighbour)
+        pair_frame = ttk.LabelFrame(relationships, text="Channel pairs (shared by colocalization and distances)", padding=8)
+        pair_frame.grid(row=0, column=0, sticky="nsew", padx=5)
+        self.pair_a = tk.StringVar(value=ROLE_LABELS[ROLES[0]])
+        self.pair_b = tk.StringVar(value=ROLE_LABELS[ROLES[1]])
+        self.pair_selectors = []
+        for column, variable in enumerate((self.pair_a, self.pair_b)):
+            widget = ttk.Combobox(pair_frame, textvariable=variable, values=tuple(ROLE_LABELS.values()), state="readonly", width=16)
+            widget.grid(row=0, column=column, padx=4)
+            self.pair_selectors.append(widget)
+        ttk.Button(pair_frame, text="Add pair", command=self._add_advanced_pair).grid(row=0, column=2, padx=4)
+        self.pair_list = tk.Listbox(pair_frame, height=9, selectmode="extended")
+        self.pair_list.grid(row=1, column=0, columnspan=3, sticky="ew", pady=8)
+        ttk.Button(pair_frame, text="Remove selected pairs", command=self._remove_advanced_pairs).grid(row=2, column=0, columnspan=3, sticky="w")
+        settings = ttk.Frame(relationships)
+        settings.grid(row=0, column=1, sticky="nsew", padx=5)
+        self.distance_settings = ttk.LabelFrame(settings, text="Object-distance settings", padding=8)
+        self._entry_grid(self.distance_settings, self.advanced_vars, [
+            ("Proximity threshold um", "proximity_um", None),
+        ])
+        self.backgrounds_frame = ttk.LabelFrame(settings, text="Colocalization background subtraction (raw units)", padding=8)
+        cell_settings = ttk.LabelFrame(cell_measurements, text="Per-cell measurement regions", padding=10)
+        cell_settings.grid(row=0, column=0, sticky="nsew", padx=5)
+        self._entry_grid(cell_settings, self.advanced_vars, [("Expansion from counted nucleus um", "cell_expansion_um", None)])
+        ttk.Label(cell_settings, wraplength=380, text=(
+            "Requires Cell Counting. Measures all enabled channels inside each confirmed nucleus plus its expansion. "
+            "Regions are clipped to the selected scope and assigned to the nearest counted nucleus, so cells do not share pixels. "
+            "These are nuclear / perinuclear measurement regions, not segmented cell bodies."
+        )).grid(row=1, column=0, columnspan=2, sticky="w", pady=12)
+        radial_settings = ttk.LabelFrame(radial, text="Radial profiles from object edges", padding=10)
+        radial_settings.grid(row=0, column=0, sticky="nsew", padx=5)
+        ttk.Label(radial_settings, text="Reference channel").grid(row=0, column=0, sticky="w")
+        self.radial_reference_widget = ttk.Combobox(
+            radial_settings, textvariable=self.radial_reference_selector,
+            values=tuple(ROLE_LABELS.values()), state="readonly", width=20,
+        )
+        self.radial_reference_widget.grid(row=0, column=1, padx=5)
+        radial_entries = ttk.Frame(radial_settings)
+        radial_entries.grid(row=1, column=0, columnspan=2, sticky="ew", pady=8)
+        self._entry_grid(radial_entries, self.advanced_vars, [
+            ("Maximum external distance um", "radial_max_um", None),
+            ("External bin width um", "radial_step_um", None),
+        ])
+        ttk.Label(radial_settings, wraplength=380, text=(
+            "Uses this channel's filtered objects, independently of Neighbour Analysis. Bin 0 includes each object's interior. "
+            "External bins extend from its edge; pixels are assigned to their nearest reference, preventing double counting. "
+            "Exports all channel intensities and positive fractions per object / bin. Curves average object means, not pooled pixels."
+        )).grid(row=2, column=0, columnspan=2, sticky="w", pady=12)
+        self.spatial_channels_frame = ttk.LabelFrame(spatial, text="Channels", padding=10)
+        self.spatial_channels_frame.grid(row=0, column=0, sticky="nsew", padx=5)
+        spatial_settings = ttk.LabelFrame(spatial, text="Spatial distribution", padding=10)
+        spatial_settings.grid(row=0, column=1, sticky="nsew", padx=5)
+        self._entry_grid(spatial_settings, self.advanced_vars, [("Centroid neighbour radius um", "spatial_radius_um", None)])
+        ttk.Label(spatial_settings, wraplength=390, text=(
+            "Measures same-channel nearest centroid distances, neighbours within the radius (excluding self), and object density. "
+            "ROI-edge truncation is flagged; no edge correction, clustering significance or Ripley's K test is claimed. "
+            "Fewer than two objects gives NaN nearest-neighbour distances."
+        )).grid(row=1, column=0, columnspan=2, sticky="w", pady=12)
+        self.skeleton_channels_frame = ttk.LabelFrame(skeleton, text="Channels", padding=10)
+        self.skeleton_channels_frame.grid(row=0, column=0, sticky="nsew", padx=5)
+        ttk.Label(skeleton, wraplength=850, text=(
+            "Skeleton Analysis uses each filtered object independently. It reports calibrated 8-neighbour pixel-graph length, "
+            "endpoints, isolated pixels and clusters of junction pixels. Preview colors identify skeleton, endpoints and junction pixels. "
+            "Touching cells can form one object; skeleton statistics are not automatic cell-type or activation classifications."
+        )).grid(row=0, column=1, sticky="w", pady=16)
+        ttk.Label(relationships, wraplength=1050, text=(
+            "PCC and Manders M1/M2 use raw background-corrected intensities in the selected ROI. "
+            "Overlap and distances use each channel's filtered masks, not neighbour-specific exclusions. "
+            "Distances: calibrated centroid and minimum pixel-center mask distance (overlap = 0). "
+            "All results are 2-D; projection overlap does not prove internalization. "
+            "No Costes automatic threshold or significance test is performed."
+        )).grid(row=1, column=0, columnspan=2, sticky="w", pady=12)
+        self._rebuild_advanced_channel_controls()
+        self._update_advanced_visibility()
+
+    def _update_advanced_visibility(self):
+        enabled = any(
+            variable.get() for key, variable in self.advanced_vars.items()
+            if key.endswith("_enabled")
+        )
+        if enabled:
+            self.advanced_empty.pack_forget()
+            self.advanced_common.pack(fill="x", pady=(0, 6))
+            self.advanced_notebook.pack(fill="both", expand=True)
+        else:
+            self.advanced_common.pack_forget()
+            self.advanced_notebook.pack_forget()
+            self.advanced_empty.pack(anchor="w", padx=8, pady=12)
+        existing = set(self.advanced_notebook.tabs())
+        for frame, title, predicate in self.advanced_sections:
+            if str(frame) in existing:
+                self.advanced_notebook.forget(frame)
+            if predicate():
+                self.advanced_notebook.add(frame, text=title)
+        if hasattr(self, "backgrounds_frame"):
+            if self.advanced_vars["colocalization_enabled"].get():
+                self.backgrounds_frame.pack(fill="x", pady=(0, 8))
+            else:
+                self.backgrounds_frame.pack_forget()
+            if self.advanced_vars["object_distances_enabled"].get():
+                self.distance_settings.pack(fill="x", pady=(0, 8))
+            else:
+                self.distance_settings.pack_forget()
+
+    def _rebuild_advanced_channel_controls(self):
+        if not hasattr(self, "backgrounds_frame"):
+            return
+        backgrounds = {role: variable.get() for role, variable in self.background_vars.items()}
+        selected = {role: variable.get() for role, variable in self.object_channel_vars.items()}
+        self.background_vars = {
+            role: tk.StringVar(value=backgrounds.get(role, "0")) for role in self.active_roles
+        }
+        self.object_channel_vars = {
+            role: tk.BooleanVar(value=selected.get(role, role in FEATURE_DEFAULTS["object_channels"]))
+            for role in self.active_roles
+        }
+        for frame in (self.backgrounds_frame, self.spatial_channels_frame, self.skeleton_channels_frame):
+            for child in frame.winfo_children():
+                child.destroy()
+        self._entry_grid(
+            self.backgrounds_frame, self.background_vars,
+            [(ROLE_LABELS[role], role, None) for role in self.active_roles],
+        )
+        for frame in (self.spatial_channels_frame, self.skeleton_channels_frame):
+            for row, role in enumerate(self.active_roles):
+                ttk.Checkbutton(frame, text=ROLE_LABELS[role], variable=self.object_channel_vars[role]).grid(
+                    row=row, column=0, sticky="w", pady=4
+                )
+
+    def _refresh_advanced_pairs(self):
+        self.pair_list.delete(0, tk.END)
+        for a, b in self.advanced_pairs:
+            self.pair_list.insert(tk.END, f"{ROLE_LABELS[a]} -> {ROLE_LABELS[b]}")
+
+    def _add_advanced_pair(self):
+        pair = [ROLE_BY_LABEL[self.pair_a.get()], ROLE_BY_LABEL[self.pair_b.get()]]
+        if pair[0] == pair[1]:
+            messagebox.showerror("Invalid pair", "Select two different channels.")
+        elif pair not in self.advanced_pairs:
+            self.advanced_pairs.append(pair)
+            self._refresh_advanced_pairs()
+
+    def _remove_advanced_pairs(self):
+        for index in reversed(self.pair_list.curselection()):
+            self.advanced_pairs.pop(index)
+        self._refresh_advanced_pairs()
+
+    def _advanced_config(self):
+        return {
+            **{key: variable.get() for key, variable in self.advanced_vars.items()},
+            "proximity_um": float(self.advanced_vars["proximity_um"].get()),
+            **{key: float(self.advanced_vars[key].get()) for key in
+               ("cell_expansion_um", "radial_max_um", "radial_step_um", "spatial_radius_um")},
+            "radial_reference_channel": ROLE_BY_LABEL[self.radial_reference_selector.get()],
+            "object_channels": [role for role, variable in self.object_channel_vars.items() if variable.get()],
+            "pairs": copy.deepcopy(self.advanced_pairs),
+            "backgrounds": {role: float(value.get()) for role, value in self.background_vars.items()},
+        }
 
     def _build_plaque_tab(self, parent: ttk.Frame) -> None:
         self.plaque_vars = {
@@ -480,10 +810,13 @@ class BrainSectionGui:
                 ("Cumulative ranges µm (e.g. 0,15,30)", "ring_edges_um", None),
             ]),
         ]
+        self.plaque_channel_widgets = []
         for column, (title, fields) in enumerate(frames):
             frame = ttk.LabelFrame(parent, text=title, padding=8)
             frame.grid(row=0, column=column, sticky="nsew", padx=5)
-            self._entry_grid(frame, self.plaque_vars, fields)
+            widgets = self._entry_grid(frame, self.plaque_vars, fields)
+            if "reference_channel" in widgets:
+                self.plaque_channel_widgets.append(widgets["reference_channel"])
             parent.columnconfigure(column, weight=1)
         ttk.Label(
             parent,
@@ -514,13 +847,13 @@ class BrainSectionGui:
         }
         frame = ttk.LabelFrame(parent, text="Cell detection", padding=8)
         frame.grid(row=0, column=0, sticky="nsew")
-        self._entry_grid(
+        widgets = self._entry_grid(
             frame,
             self.microglia_vars,
             [
                 ("Enable cell counting", "enabled", None),
-                ("Nucleus channel", "nucleus_channel", CELL_CHANNEL_CHOICES),
-                ("Confirmation channel (optional)", "confirmation_channel", CELL_CHANNEL_CHOICES),
+                ("Nucleus channel", "nucleus_channel", ("", *ROLE_LABELS.values())),
+                ("Confirmation channel (optional)", "confirmation_channel", ("", *ROLE_LABELS.values())),
                 ("Nucleus open px", "opening_radius_px", None),
                 ("Nucleus close px", "closing_radius_px", None),
                 ("Fill nucleus holes", "fill_holes", None),
@@ -535,6 +868,7 @@ class BrainSectionGui:
                 ("Minimum confirmation-positive fraction", "min_confirmation_positive_fraction", None),
             ],
         )
+        self.cell_channel_widgets = [widgets["nucleus_channel"], widgets["confirmation_channel"]]
         ttk.Label(
             parent,
             text="Choose any enabled nucleus channel. Leave confirmation blank to count by nucleus morphology only.",
@@ -554,10 +888,25 @@ class BrainSectionGui:
                 "open_output": tk.BooleanVar(value=True),
             }
         )
+        self.qc_panel_labels = {
+            key: QC_PANEL_LABELS.get(key, PROCESSING_CHOICES.get(key, key.replace("_", " ").title()))
+            for key in qc_panel_choices(len(self.active_roles))
+        }
         self.qc_panel_vars = {
-            key: tk.BooleanVar(value=True) for key in QC_PANEL_DEFAULTS
+            key: tk.BooleanVar(value=key in QC_PANEL_DEFAULTS) for key in self.qc_panel_labels
         }
 
+        self.processing_choices = processing_choices(len(self.active_roles))
+        self.processing_vars = {key: tk.BooleanVar(value=True) for key in self.processing_choices}
+        self.drawing_vars = {
+            key: (tk.BooleanVar(value=value) if isinstance(value, bool) else tk.StringVar(value=str(value)))
+            for key, value in DRAWING_DEFAULTS.items() if key != "boundaries"
+        }
+        self.boundary_vars = {
+            key: {"color": tk.StringVar(value=value["color"]), "width_px": tk.StringVar(value=str(value["width_px"]))}
+            for key, value in DRAWING_DEFAULTS["boundaries"].items()
+        }
+        self.boundary_vars["ring"]["width_px"] = self.output_vars["ring_boundary_width_px"]
         table_frame = ttk.LabelFrame(parent, text="Table columns", padding=8)
         table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         ttk.Label(
@@ -589,6 +938,8 @@ class BrainSectionGui:
             ("Composite image", "save_composite_image"),
             ("Segmentation overlay images", "save_segmentation_images"),
             ("Mask preview images", "save_mask_images"),
+            ("Intermediate pipeline images", "save_stage_images"),
+            ("Advanced analysis images", "save_advanced_images"),
             ("Tissue ROI mask TIFF", "save_tissue_mask"),
             ("Neighbour-reference label TIFF", "save_primary_object_labels"),
             ("Excluded-object mask TIFFs", "save_excluded_object_masks"),
@@ -602,24 +953,17 @@ class BrainSectionGui:
             )
         ttk.Label(
             image_frame,
-            text="The first five choices also control which preview images are generated.",
+            text="PNG image choices also control generated previews.",
             wraplength=230,
         ).grid(row=len(image_outputs), column=0, sticky="w", pady=(8, 0))
-        qc_menu_button = ttk.Menubutton(image_frame, text="Overview QC panels...")
-        qc_menu = tk.Menu(qc_menu_button, tearoff=False)
-        for key, label in QC_PANEL_LABELS.items():
-            qc_menu.add_checkbutton(
-                label=label,
-                variable=self.qc_panel_vars[key],
-                command=self._update_qc_panel_status,
-            )
-        qc_menu_button.configure(menu=qc_menu)
+        qc_menu_button = ttk.Button(image_frame, text="Overview QC panels...", command=self._choose_qc_panels)
         qc_menu_button.grid(row=len(image_outputs) + 1, column=0, sticky="w", pady=(8, 0))
         self.qc_panel_status = tk.StringVar()
         ttk.Label(image_frame, textvariable=self.qc_panel_status).grid(
             row=len(image_outputs) + 2, column=0, sticky="w", pady=(4, 0)
         )
         self._update_qc_panel_status()
+        ttk.Button(image_frame, text="Choose processing images...", command=self._choose_processing_images).grid(row=len(image_outputs) + 3, column=0, sticky="w", pady=6)
 
         preview_frame = ttk.LabelFrame(parent, text="Processed preview", padding=8)
         preview_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
@@ -657,7 +1001,7 @@ class BrainSectionGui:
         )
         display_settings = ttk.Frame(preview_frame)
         display_settings.grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(display_settings, text="Boundary width px").pack(side="left")
+        ttk.Label(display_settings, text="Ring width px").pack(side="left")
         ttk.Entry(
             display_settings, textvariable=self.output_vars["ring_boundary_width_px"], width=7
         ).pack(side="left", padx=(3, 12))
@@ -665,6 +1009,9 @@ class BrainSectionGui:
         ttk.Entry(
             display_settings, textvariable=self.output_vars["preview_max_dimension_px"], width=8
         ).pack(side="left", padx=3)
+        ttk.Button(display_settings, text="Plot settings...", command=self._plot_settings).pack(side="left", padx=8)
+        ttk.Button(preview_frame, text="Apply display settings to preview", command=self._redraw_preview).grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Label(preview_frame, text="Display only; rerun Preview after changing segmentation or analysis.").grid(row=5, column=0, sticky="w")
         preview_frame.rowconfigure(0, weight=1)
         preview_frame.columnconfigure(0, weight=1)
 
@@ -693,6 +1040,138 @@ class BrainSectionGui:
 
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(2, weight=1)
+
+    def _drawing_config(self):
+        result = {key: variable.get() for key, variable in self.drawing_vars.items()}
+        for key in ("low_percentile", "high_percentile", "gamma", "gain", "opacity"):
+            result[key] = float(result[key])
+        for key in ("dpi", "font_size", "histogram_bins"):
+            result[key] = int(result[key])
+        result["boundaries"] = {
+            name: {"color": variables["color"].get(), "width_px": int(variables["width_px"].get())}
+            for name, variables in self.boundary_vars.items()
+        }
+        return result
+
+    def _choose_processing_images(self):
+        self._choose_image_selection(self.processing_vars, self.processing_choices, "Processing images to save and preview")
+
+    def _choose_qc_panels(self):
+        self._choose_image_selection(self.qc_panel_vars, self.qc_panel_labels, "Overview QC panels")
+
+    def _choose_image_selection(self, variables, choices, title):
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.geometry("650x620")
+        window.transient(self.root)
+        window.grab_set()
+        ttk.Label(window, text="Select the images to include. Image-category switches still apply.").pack(pady=8)
+        frame = ttk.Frame(window)
+        frame.pack(fill="both", expand=True, padx=12)
+        listing = tk.Listbox(frame, selectmode="multiple", exportselection=False)
+        listing.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(frame, command=listing.yview)
+        scroll.pack(side="right", fill="y")
+        listing.configure(yscrollcommand=scroll.set)
+        keys = list(choices)
+        for index, key in enumerate(keys):
+            listing.insert(tk.END, choices[key])
+            if variables[key].get():
+                listing.selection_set(index)
+        buttons = ttk.Frame(window, padding=10)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="All", command=lambda: listing.selection_set(0, tk.END)).pack(side="left", padx=4)
+        ttk.Button(buttons, text="None", command=lambda: listing.selection_clear(0, tk.END)).pack(side="left", padx=4)
+        def apply():
+            selection = set(listing.curselection())
+            for index, key in enumerate(keys):
+                variables[key].set(index in selection)
+            self._update_qc_panel_status()
+            window.destroy()
+        ttk.Button(buttons, text="Apply", command=apply).pack(side="right", padx=4)
+
+    def _plot_settings(self):
+        window = tk.Toplevel(self.root)
+        window.title("Plot settings (display only)")
+        window.geometry("960x650")
+        window.transient(self.root)
+        left = ttk.LabelFrame(window, text="Image and figure display", padding=8)
+        left.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self._entry_grid(left, self.drawing_vars, [
+            ("Low display percentile", "low_percentile", None),
+            ("High display percentile", "high_percentile", None),
+            ("Gamma", "gamma", None), ("Brightness gain", "gain", None),
+            ("Boundary / overlap opacity", "opacity", None),
+            ("Show object IDs", "show_object_ids", None),
+            ("Label font size px", "font_size", None), ("Figure DPI", "dpi", None),
+            ("Figure background #RRGGBB", "background", None),
+            ("Heatmap color map", "heatmap_cmap", ("viridis", "magma", "inferno", "plasma", "cividis", "gray", "turbo")),
+            ("Histogram bins", "histogram_bins", None),
+            ("Log-scale density colors", "density_log_scale", None),
+        ])
+        right = ttk.LabelFrame(window, text="Boundary style", padding=8)
+        right.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        labels = {name: ROLE_LABELS.get(name, name.replace("_", " ").title()) for name in self.boundary_vars}
+        selected = tk.StringVar(value=labels["ring"])
+        selector = ttk.Combobox(right, textvariable=selected, values=tuple(labels.values()), state="readonly", width=24)
+        selector.grid(row=0, column=0, columnspan=2, pady=8)
+        frames = {}
+        for name, variables in self.boundary_vars.items():
+            frame = ttk.Frame(right)
+            frame.grid(row=1, column=0, columnspan=2)
+            self._entry_grid(frame, variables, [("Line color #RRGGBB", "color", None), ("Line width (rendered px)", "width_px", None)])
+            ttk.Button(frame, text="Pick color", command=lambda v=variables["color"]: self._pick_color(v)).grid(row=2, column=1, pady=8)
+            frames[labels[name]] = frame
+        selector.bind("<<ComboboxSelected>>", lambda _: frames[selected.get()].tkraise())
+        frames[selected.get()].tkraise()
+        ttk.Label(right, text="Channel image colors are set in Channels.\nLine widths are measured in the saved PNG,\nnot in the full-resolution source image.", wraplength=300).grid(row=2, column=0, columnspan=2, sticky="w", pady=14)
+        ttk.Button(window, text="Apply display settings to preview", command=self._redraw_preview).grid(row=1, column=0, padx=8, pady=8, sticky="w")
+        ttk.Button(window, text="Close", command=window.destroy).grid(row=1, column=1, padx=8, pady=8, sticky="e")
+        ttk.Label(window, text="Display settings do not alter thresholds, masks or measurement values.").grid(row=2, column=0, columnspan=2, padx=8, sticky="w")
+
+    def _redraw_preview(self):
+        if self.run_button.instate(["disabled"]):
+            return
+        if not self.preview_context:
+            messagebox.showinfo("Preview required", "Run Preview selected image first.")
+            return
+        try:
+            context = self.preview_context
+            config = copy.deepcopy(context["config"])
+            config["output"]["drawing"] = self._drawing_config()
+            config["output"]["preview_max_dimension_px"] = int(self.output_vars["preview_max_dimension_px"].get())
+            config["output"]["processing_steps"] = [key for key, value in self.processing_vars.items() if value.get()]
+            config["output"]["qc_panels"] = [key for key, value in self.qc_panel_vars.items() if value.get()]
+            for key in PREVIEW_IMAGE_OUTPUT_KEYS:
+                config["output"][key] = bool(self.output_vars[key].get())
+            # Read colors/names only; cached segmentation and analysis stay unchanged.
+            for role in self.active_roles:
+                config["channels"][role]["color"] = self.channel_vars[role]["color"].get()
+            config = normalize_config(config, context["info"])
+            self._set_busy(True)
+            self.status.set("Rendering cached preview...")
+        except Exception as error:
+            messagebox.showerror("Invalid plot settings", str(error))
+            return
+        def worker():
+            try:
+                output = config["output"]
+                directory = Path(config["input"]["output_dir"])
+                files = save_qc(
+                    directory / "cell_analysis_qc.png" if output["save_qc"] else None,
+                    context["images"], context["products"], output["preview_max_dimension_px"],
+                    _channel_colors(context["info"], config, set(context["images"])),
+                    {role: config["channels"][role]["alias"] for role in context["images"]},
+                    config["microglia_count"], config["plaque"]["reference_channel"] if context["products"].neighbour_enabled else next(iter(context["images"])), output["qc_panels"], directory / "processing_images",
+                    save_raw_channels=output["save_raw_channel_images"], save_composite=output["save_composite_image"],
+                    save_segmentation=output["save_segmentation_images"], save_mask_images=output["save_mask_images"],
+                    save_stages=output["save_stage_images"], save_advanced=output["save_advanced_images"],
+                    drawing=output["drawing"], processing_steps=output["processing_steps"],
+                )
+                self.messages.put(("redraw_complete", files))
+            except Exception as error:
+                self.messages.put(("error", error))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _update_qc_panel_status(self) -> None:
         selected = sum(variable.get() for variable in self.qc_panel_vars.values())
@@ -903,6 +1382,7 @@ class BrainSectionGui:
     def _inspect_selected(self) -> None:
         try:
             source = self._selected_path()
+            first_inspection = self.info is None
             cache_value = self.cache_root.get().strip()
             if cache_value:
                 configure_cache_directory(cache_value)
@@ -913,18 +1393,19 @@ class BrainSectionGui:
                 image_width_um=_optional_float(self.input_vars["image_width_um"]),
                 image_height_um=_optional_float(self.input_vars["image_height_um"]),
             )
-            if len(self.info.channels) < 3:
-                raise ValueError(f"Cell analysis requires at least 3 channels; this file has {len(self.info.channels)}.")
+            self._set_channel_count(len(self.info.channels))
             choices = [f"{channel.index}: {channel.name}" for channel in self.info.channels]
             available = {channel.index for channel in self.info.channels}
-            for role in ROLES:
+            for position, role in enumerate(self.active_roles):
                 variables = self.channel_vars[role]
+                if first_inspection:
+                    variables["enabled"].set(True)
                 variables["index_widget"].configure(values=choices)
                 try:
                     current = int(str(variables["index"].get()).split(":", 1)[0])
                 except ValueError:
                     current = -1
-                index = current if current in available else self.info.channels[min(ROLES.index(role), len(self.info.channels) - 1)].index
+                index = current if current in available else self.info.channels[position].index
                 match = next((choice for choice in choices if choice.startswith(f"{index}:")), choices[0])
                 variables["index"].set(match)
             if not self.input_vars["pixel_size_um_x"].get() and self.info.pixel_size_um_x:
@@ -972,6 +1453,11 @@ class BrainSectionGui:
     ) -> dict[str, Any]:
         source = source or self._selected_path()
         config = copy.deepcopy(DEFAULT_CONFIG)
+        config["channels"] = {
+            role: default_channel(role, position)
+            for position, role in enumerate(self.active_roles)
+        }
+        config["advanced"] = self._advanced_config()
         output_value = self.output_root.get().strip()
         cache_value = self.cache_root.get().strip()
         if require_output and not output_value:
@@ -1001,10 +1487,11 @@ class BrainSectionGui:
                 "image_height_um": _optional_float(self.input_vars["image_height_um"]),
             }
         )
-        for role in ROLES:
+        for role in self.active_roles:
             variables = self.channel_vars[role]
             config["channels"][role].update(
                 {
+                    "enabled": bool(variables["enabled"].get()),
                     "index": int(str(variables["index"].get()).split(":", 1)[0]),
                     "alias": variables["alias"].get().strip(),
                     "wavelength_nm": _optional_float(variables["wavelength_nm"]),
@@ -1018,8 +1505,7 @@ class BrainSectionGui:
                     },
                 }
             )
-        config["channels"]["dapi"]["enabled"] = bool(self.channel_vars["dapi"]["enabled"].get())
-        for role in ROLES:
+        for role in self.active_roles:
             variables = self.marker_vars[role]
             config["channels"][role]["object_filter"].update(
                 {
@@ -1117,6 +1603,8 @@ class BrainSectionGui:
                     for key in OUTPUT_SELECTION_DEFAULTS
                 },
                 "table_columns": copy.deepcopy(self.selected_output_columns),
+                "drawing": self._drawing_config(),
+                "processing_steps": (None if all(v.get() for v in self.processing_vars.values()) else [key for key, value in self.processing_vars.items() if value.get()]),
                 "qc_panels": [
                     key for key, variable in self.qc_panel_vars.items() if variable.get()
                 ],
@@ -1138,6 +1626,23 @@ class BrainSectionGui:
         return normalize_config(config, info)
 
     def _apply_config(self, config: dict[str, Any]) -> None:
+        channel_count = len(config.get("channels", {}))
+        if channel_count and channel_count != len(self.active_roles):
+            self._set_channel_count(channel_count)
+        advanced = config.get("advanced", {})
+        for key, variable in self.advanced_vars.items():
+            default = DEFAULT_CONFIG["advanced"][key]
+            if key == "neighbour_enabled" and "advanced" not in config and "plaque" in config:
+                default = True
+            variable.set(advanced.get(key, default))
+        self.advanced_pairs = copy.deepcopy(advanced.get("pairs", []))
+        radial_role = advanced.get("radial_reference_channel", self.active_roles[0])
+        self.radial_reference_selector.set(ROLE_LABELS.get(radial_role, ROLE_LABELS[self.active_roles[0]]))
+        for role, variable in self.object_channel_vars.items():
+            variable.set(role in advanced.get("object_channels", FEATURE_DEFAULTS["object_channels"]))
+        self._refresh_advanced_pairs()
+        for role, variable in self.background_vars.items():
+            variable.set(advanced.get("backgrounds", {}).get(role, 0))
         application = config.get("application", {})
         if application.get("cache_directory"):
             self.cache_root.set(str(application["cache_directory"]))
@@ -1149,23 +1654,23 @@ class BrainSectionGui:
         ):
             value = input_config.get(key, default)
             self.input_vars[key].set("" if value is None else str(value))
-        for role in ROLES:
+        for position, role in enumerate(self.active_roles):
             item = config.get("channels", {}).get(role, {})
             variables = self.channel_vars[role]
-            variables["enabled"].set(bool(item.get("enabled", role != "dapi")))
-            variables["index"].set(str(item.get("index", ROLES.index(role))))
+            variables["enabled"].set(bool(item.get("enabled", True)))
+            variables["index"].set(str(item.get("index", position)))
             variables["alias"].set(str(item.get("alias", ROLE_LABELS[role])))
             wavelength = item.get("wavelength_nm")
             variables["wavelength_nm"].set("" if wavelength is None else str(wavelength))
-            variables["color"].set(str(item.get("color", DEFAULT_CONFIG["channels"][role]["color"])))
+            variables["color"].set(str(item.get("color", default_channel(role, position)["color"])))
             variables["sigma"].set(str(item.get("gaussian_sigma_px", 1.0)))
             threshold = item.get("threshold", {})
             for key, default in (("method", "otsu"), ("value", 0), ("scale", 1), ("percentile", 95)):
                 variables[key].set(str(threshold.get(key, default)))
-        for role in ROLES:
+        for position, role in enumerate(self.active_roles):
             item = config.get("channels", {}).get(role, {}).get("object_filter", {})
             for key, variable in self.marker_vars[role].items():
-                value = item.get(key, DEFAULT_CONFIG["channels"][role]["object_filter"].get(key))
+                value = item.get(key, default_channel(role, position)["object_filter"].get(key))
                 variable.set("" if value is None else value)
         roi = config.get("tissue_roi", {})
         for key, variable in self.roi_vars.items():
@@ -1193,6 +1698,18 @@ class BrainSectionGui:
             self.output_vars[key].set(output.get(key, default))
         for key in ("ring_boundary_width_px", "preview_max_dimension_px"):
             self.output_vars[key].set(output.get(key, DEFAULT_CONFIG["output"][key]))
+        drawing = output.get("drawing", {})
+        for key, variable in self.drawing_vars.items():
+            variable.set(drawing.get(key, DRAWING_DEFAULTS[key]))
+        for name, variables in self.boundary_vars.items():
+            for key, variable in variables.items():
+                default = DRAWING_DEFAULTS["boundaries"][name][key]
+                if name == "ring" and key == "width_px":
+                    default = output.get("ring_boundary_width_px", 1)
+                variable.set(drawing.get("boundaries", {}).get(name, {}).get(key, default))
+        steps = output.get("processing_steps")
+        for key, variable in self.processing_vars.items():
+            variable.set(steps is None or key in steps)
         selected_qc_panels = set(output.get("qc_panels", QC_PANEL_DEFAULTS))
         for key, variable in self.qc_panel_vars.items():
             variable.set(key in selected_qc_panels)
@@ -1201,6 +1718,7 @@ class BrainSectionGui:
         self._update_output_column_status()
         self.output_vars["continue_on_error"].set(bool(config.get("batch", {}).get("continue_on_error", True)))
         self.metadata_csv.set(str(config.get("batch", {}).get("metadata_csv") or ""))
+        self._update_advanced_visibility()
 
     def _load_session(self) -> None:
         value = filedialog.askopenfilename(
@@ -1292,6 +1810,7 @@ class BrainSectionGui:
             if config["tissue_roi"]["mode"] == "mask_directory":
                 _resolve_mask(config, source)
             self._set_busy(True)
+            self.preview_context = None
             self.status.set("Generating preview...")
         except Exception as error:
             messagebox.showerror("Invalid preview parameters", str(error))
@@ -1352,7 +1871,7 @@ class BrainSectionGui:
             values=choices, state="readonly" if choices else "disabled"
         )
         if choices:
-            self.preview_choice.set(choices[0])
+            self.preview_choice.set(self.preview_choice.get() if self.preview_choice.get() in choices else choices[0])
             self._show_selected_preview()
         else:
             self.preview_choice.set("")
@@ -1403,11 +1922,16 @@ class BrainSectionGui:
                 elif kind == "preview_complete":
                     self._set_busy(False)
                     self.status.set("Preview complete")
+                    self.preview_context = value.pop("_render_context", None)
                     self._set_available_output_columns(value.pop("_tables", {}))
                     try:
                         self._set_preview_files(value.get("files", {}))
                     except Exception as error:
                         messagebox.showerror("Could not display preview", str(error))
+                elif kind == "redraw_complete":
+                    self._set_busy(False)
+                    self.status.set("Display settings applied (measurements unchanged)")
+                    self._set_preview_files(value)
                 elif kind == "complete":
                     self._set_busy(False)
                     self.status.set("Batch analysis complete")

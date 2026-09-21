@@ -14,6 +14,16 @@ from cell_analyzer.image_io import inspect_image
 from cell_analyzer.models import CziInfo
 
 
+from .advanced import (
+    ADVANCED_DEFAULTS,
+    CHANNEL_COLORS,
+    DRAWING_DEFAULTS,
+    STAGE_LABELS,
+    normalize_advanced,
+    roles_for_count,
+)
+from .advanced_features import ADVANCED_TABLES, FEATURE_IMAGES
+
 THRESHOLD_METHODS = {"manual", "otsu", "yen", "triangle", "percentile"}
 QC_PANEL_DEFAULTS = (
     "05_composite",
@@ -27,6 +37,22 @@ QC_PANEL_DEFAULTS = (
     "11_tissue_roi",
 )
 
+
+QC_PANEL_CHOICES = (*QC_PANEL_DEFAULTS, *STAGE_LABELS, *(f"raw_channel_{i}" for i in range(1, 5)), *FEATURE_IMAGES)
+PROCESSING_CHOICES = {
+    **FEATURE_IMAGES,
+    **{name: name.replace("_", " ").title() for name in QC_PANEL_DEFAULTS},
+    **STAGE_LABELS,
+    **{f"raw_channel_{i}": f"Channel {i}: raw image" for i in range(1, 5)},
+    **{f"mask_channel_{i}_object_filter_mask": f"Channel {i}: filtered mask" for i in range(1, 5)},
+    "mask_neighbour_reference_object_mask": "Neighbour reference mask",
+    "mask_neighbour_excluded_object_mask": "Excluded object mask",
+    "mask_neighbour_no_nearby_cell_excluded": "No-nearby-cell mask",
+    "mask_nucleus_mask": "Nucleus mask", "mask_cell_mask": "Confirmed cell mask",
+    "individual_rings": "Individual distance-range masks and overlays",
+    "advanced_overlap": "Advanced: overlap maps", "advanced_scatter": "Advanced: intensity density plots",
+    "advanced_distance": "Advanced: distance heatmaps", "advanced_histogram": "Advanced: distance histograms",
+}
 
 DEFAULT_THRESHOLD: dict[str, Any] = {
     "method": "otsu",
@@ -70,6 +96,9 @@ OUTPUT_SELECTION_DEFAULTS: dict[str, bool] = {
     "save_composite_image": True,
     "save_segmentation_images": True,
     "save_mask_images": True,
+    "save_stage_images": True,
+    "save_advanced_images": True,
+    **{flag: True for _, flag in ADVANCED_TABLES.values()},
 }
 MASK_OUTPUT_KEYS = (
     "save_tissue_mask", "save_primary_object_labels", "save_excluded_object_masks",
@@ -77,11 +106,12 @@ MASK_OUTPUT_KEYS = (
 )
 PROCESSING_IMAGE_OUTPUT_KEYS = (
     "save_raw_channel_images", "save_composite_image",
-    "save_segmentation_images", "save_mask_images",
+    "save_segmentation_images", "save_mask_images", "save_stage_images", "save_advanced_images",
 )
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "advanced": copy.deepcopy(ADVANCED_DEFAULTS),
     "application": {"cache_directory": None},
     "input": {
         "image_path": "",
@@ -205,6 +235,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output": {
         **OUTPUT_SELECTION_DEFAULTS,
         "table_columns": {},
+        "drawing": copy.deepcopy(DRAWING_DEFAULTS),
+        "processing_steps": None,
         "qc_panels": list(QC_PANEL_DEFAULTS),
         # Legacy aggregate keys remain readable by older sessions and notebooks.
         "save_masks": True,
@@ -223,6 +255,62 @@ def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]
         else:
             result[key] = copy.deepcopy(value)
     return result
+
+
+def default_channel(role: str, position: int) -> dict[str, Any]:
+    """Create one channel config; legacy role keys keep their saved defaults."""
+
+    legacy = DEFAULT_CONFIG["channels"].get(role, DEFAULT_CONFIG["channels"]["abeta"])
+    result = copy.deepcopy(legacy)
+    result.update(
+        enabled=True,
+        index=position,
+        alias=f"Channel {position + 1}",
+        color=CHANNEL_COLORS[position % len(CHANNEL_COLORS)],
+    )
+    return result
+
+
+def dynamic_stage_labels(count: int) -> dict[str, str]:
+    return {
+        f"stage_channel_{index}_{stage}": f"Channel {index}: {title}"
+        for index in range(1, count + 1)
+        for stage, title in {
+            "gaussian": "Gaussian image", "threshold": "Threshold mask",
+            "morphology": "Morphology mask", "candidates": "Candidate labels",
+            "accepted": "Accepted mask", "rejected": "Rejected mask",
+        }.items()
+    }
+
+
+def processing_choices(count: int) -> dict[str, str]:
+    def available(name: str) -> bool:
+        match = re.search(r"(?:channel_|_channel_)([0-9]+)", name)
+        return match is None or int(match.group(1)) <= count
+
+    choices = {key: value for key, value in PROCESSING_CHOICES.items() if available(key)}
+    choices.update(dynamic_stage_labels(count))
+    choices.update({f"raw_channel_{i}": f"Channel {i}: raw image" for i in range(1, count + 1)})
+    choices.update({f"mask_channel_{i}_object_filter_mask": f"Channel {i}: filtered mask" for i in range(1, count + 1)})
+    return choices
+
+
+def qc_panel_choices(count: int) -> tuple[str, ...]:
+    def available(name: str) -> bool:
+        match = re.search(r"(?:channel_|_channel_)([0-9]+)", name)
+        return match is None or int(match.group(1)) <= count
+
+    return tuple(dict.fromkeys((
+        *(name for name in QC_PANEL_CHOICES if available(name)),
+        *(f"07_channel_{i}_objects" for i in range(1, count + 1)),
+        *(f"raw_channel_{i}" for i in range(1, count + 1)),
+        *dynamic_stage_labels(count),
+    )))
+
+
+def _selection_channel(name: str) -> int | None:
+    match = re.search(r"(?:channel_|_channel_)([0-9]+)", name)
+    return int(match.group(1)) if match else None
 
 
 def _wavelength_family(value: int) -> set[int]:
@@ -316,9 +404,12 @@ def create_default_config(
     )
     config["input"]["pixel_size_um_x"] = info.pixel_size_um_x
     config["input"]["pixel_size_um_y"] = info.pixel_size_um_y
-    for position, role in enumerate(("abeta", "iba1", "cd68", "dapi")):
-        if position < len(info.channels):
-            config["channels"][role]["index"] = info.channels[position].index
+    config["channels"] = {
+        role: default_channel(role, position)
+        for position, role in enumerate(roles_for_count(len(info.channels)))
+    }
+    for position, role in enumerate(config["channels"]):
+        config["channels"][role]["index"] = info.channels[position].index
     return config
 
 
@@ -341,6 +432,11 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     """Merge defaults and validate fields needed by the analysis engine."""
 
     merged = _deep_merge(DEFAULT_CONFIG, config)
+    if "advanced" not in config and "plaque" in config:
+        # Preserve the always-on neighbour workflow of previous saved sessions.
+        merged["advanced"]["neighbour_enabled"] = True
+    if "drawing" not in config.get("output", {}):
+        merged["output"]["drawing"]["boundaries"]["ring"]["width_px"] = config.get("output", {}).get("ring_boundary_width_px", 1)
     cache_directory = merged["application"].get("cache_directory")
     merged["application"]["cache_directory"] = (
         str(Path(cache_directory).expanduser().resolve()) if cache_directory else None
@@ -360,19 +456,33 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     if input_config.get("z_projection") not in {"single", "max", "mean"}:
         raise ValueError("input.z_projection must be single, max, or mean.")
 
+    if not info.channels:
+        raise ValueError("The image has no readable channels.")
+    channel_roles = roles_for_count(len(info.channels))
+    supplied_channels = config.get("channels", {})
+    merged["channels"] = {
+        role: _deep_merge(
+            default_channel(role, position),
+            supplied_channels.get(role, {}),
+        )
+        for position, role in enumerate(channel_roles)
+    }
+    for position, role in enumerate(channel_roles):
+        if role not in supplied_channels:
+            merged["channels"][role]["index"] = info.channels[position].index
     available = {channel.index for channel in info.channels}
-    dapi_enabled = bool(merged["channels"]["dapi"].get("enabled", False))
-    merged["channels"]["dapi"]["enabled"] = dapi_enabled
+    roles = tuple(
+        role for role, item in merged["channels"].items()
+        if bool(item.get("enabled", True))
+    )
+    if not roles:
+        raise ValueError("Enable at least one image channel.")
     indices: list[int] = []
     export_names: list[str] = []
-    roles = (
-        ("abeta", "iba1", "cd68", "dapi")
-        if dapi_enabled
-        else ("abeta", "iba1", "cd68")
-    )
-    for role in roles:
+    for position, role in enumerate(merged["channels"]):
         item = merged["channels"][role]
-        item["alias"] = str(item.get("alias") or f"Channel {roles.index(role) + 1}").strip()
+        item["enabled"] = bool(item.get("enabled", True))
+        item["alias"] = str(item.get("alias") or f"Channel {position + 1}").strip()
         wavelength = item.get("wavelength_nm")
         item["wavelength_nm"] = None if wavelength in {None, ""} else float(wavelength)
         if item["wavelength_nm"] is not None and item["wavelength_nm"] <= 0:
@@ -380,13 +490,15 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
         item["color"] = str(item.get("color") or "").upper()
         if not re.fullmatch(r"#[0-9A-F]{6}", item["color"]):
             raise ValueError(f"{item['alias']} color must be #RRGGBB.")
-        export_names.append(re.sub(r"[^a-z0-9]+", "_", item["alias"].lower()).strip("_"))
+        if item["enabled"]:
+            export_names.append(re.sub(r"[^a-z0-9]+", "_", item["alias"].lower()).strip("_"))
         item["index"] = int(item["index"])
-        if item["index"] not in available:
+        if item["enabled"] and item["index"] not in available:
             raise ValueError(
                 f"{item['alias']} image channel {item['index']} is unavailable; available channels: {sorted(available)}"
             )
-        indices.append(item["index"])
+        if item["enabled"]:
+            indices.append(item["index"])
         item["gaussian_sigma_px"] = max(0.0, float(item.get("gaussian_sigma_px", 0.0)))
         threshold = item["threshold"]
         threshold["method"] = str(threshold.get("method", "otsu")).lower()
@@ -401,7 +513,7 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
             raise ValueError(f"{item['alias']} threshold scale must be greater than zero.")
         if not 0 <= threshold["percentile"] <= 100:
             raise ValueError(f"{item['alias']} threshold percentile must be between 0 and 100.")
-        if role in roles:
+        if item["enabled"]:
             object_filter = item["object_filter"]
             object_filter["enabled"] = bool(object_filter.get("enabled", True))
             object_filter["opening_radius_px"] = max(
@@ -455,7 +567,7 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
 
     plaque = merged["plaque"]
     plaque["reference_channel"] = str(plaque.get("reference_channel", "abeta"))
-    if plaque["reference_channel"] not in roles:
+    if plaque["reference_channel"] not in (roles if merged["advanced"]["neighbour_enabled"] else channel_roles):
         raise ValueError("Neighbour analysis must select an enabled reference channel.")
     plaque["opening_radius_px"] = max(0, int(plaque.get("opening_radius_px", 0)))
     plaque["closing_radius_px"] = max(0, int(plaque.get("closing_radius_px", 0)))
@@ -559,7 +671,11 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     qc_panels = output.get("qc_panels", QC_PANEL_DEFAULTS)
     if not isinstance(qc_panels, (list, tuple)):
         raise ValueError("output.qc_panels must be a list.")
-    unknown_qc_panels = set(qc_panels) - set(QC_PANEL_DEFAULTS)
+    qc_panels = [
+        name for name in qc_panels
+        if _selection_channel(name) in {None, *range(1, len(channel_roles) + 1)}
+    ]
+    unknown_qc_panels = set(qc_panels) - set(qc_panel_choices(len(channel_roles)))
     if unknown_qc_panels:
         raise ValueError(f"Unknown output.qc_panels: {sorted(unknown_qc_panels)}")
     output["qc_panels"] = list(dict.fromkeys(qc_panels))
@@ -650,8 +766,50 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     microglia["perinuclear_radius_um"] = max(
         0.0, float(microglia.get("perinuclear_radius_um", 3.0))
     )
-    if plaque["require_nearby_microglia"] and not microglia["enabled"]:
+    if merged["advanced"]["neighbour_enabled"] and plaque["require_nearby_microglia"] and not microglia["enabled"]:
         raise ValueError(
             "Nearby-cell gating requires cell counting to be enabled."
         )
+    normalize_advanced(merged, roles)
+    steps = output.get("processing_steps")
+    if steps is not None:
+        steps = [
+            name for name in steps
+            if _selection_channel(name) in {None, *range(1, len(channel_roles) + 1)}
+        ]
+        if not isinstance(steps, (list, tuple)) or set(steps) - set(processing_choices(len(channel_roles))):
+            raise ValueError("Unknown processing image selection.")
+        output["processing_steps"] = list(dict.fromkeys(steps))
+    drawing = output["drawing"]
+    for key in ("low_percentile", "high_percentile", "gamma", "gain", "opacity"):
+        drawing[key] = float(drawing[key])
+        if not math.isfinite(drawing[key]):
+            raise ValueError(f"Drawing {key} must be finite.")
+    if not 0 <= drawing["low_percentile"] < drawing["high_percentile"] <= 100:
+        raise ValueError("Display percentiles must satisfy 0 <= low < high <= 100.")
+    if drawing["gamma"] <= 0 or drawing["gain"] < 0 or not 0 <= drawing["opacity"] <= 1:
+        raise ValueError("Gamma must be positive, gain nonnegative, and opacity between 0 and 1.")
+    for key, minimum, maximum in (("font_size", 6, 48), ("dpi", 72, 600), ("histogram_bins", 5, 512)):
+        drawing[key] = int(drawing[key])
+        if not minimum <= drawing[key] <= maximum:
+            raise ValueError(f"Drawing {key} must be between {minimum} and {maximum}.")
+    drawing["density_log_scale"] = bool(drawing["density_log_scale"])
+    drawing["show_object_ids"] = bool(drawing["show_object_ids"])
+    if drawing["heatmap_cmap"] not in {"viridis", "magma", "inferno", "plasma", "cividis", "gray", "turbo"}:
+        raise ValueError("Unknown display heatmap color map.")
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(drawing["background"])):
+        raise ValueError("Plot background must be #RRGGBB.")
+    for position, role in enumerate(channel_roles):
+        drawing["boundaries"].setdefault(
+            role,
+            {"color": merged["channels"][role]["color"], "width_px": 1},
+        )
+    for name, style in drawing["boundaries"].items():
+        if name not in DRAWING_DEFAULTS["boundaries"] and name not in channel_roles:
+            continue
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(style["color"])):
+            raise ValueError("Boundary colors must be #RRGGBB.")
+        style["width_px"] = int(style["width_px"])
+        if not 1 <= style["width_px"] <= 50:
+            raise ValueError("Boundary width must be between 1 and 50 display pixels.")
     return merged

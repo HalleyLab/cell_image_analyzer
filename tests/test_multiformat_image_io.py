@@ -13,7 +13,7 @@ from cell_analyzer.image_io import inspect_image, read_image_channels
 
 class MultiFormatImageIoTest(unittest.TestCase):
     def test_runtime_cache_and_temp_stay_with_project(self) -> None:
-        expected = Path(__file__).resolve().parent.parent / ".cache"
+        expected = Path(__file__).resolve().parent.parent / "local_artifacts" / "cache" / "application"
         self.assertEqual(Path(tempfile.gettempdir()), expected / "tmp")
         for name in ("CELL_ANALYZER_CACHE_DIR", "CJDK_CACHE_DIR", "MPLCONFIGDIR"):
             configured = Path(os.environ[name]).resolve()

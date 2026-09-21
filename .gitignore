@@ -1,5 +1,7 @@
 .venv/
 .cache/
+local_artifacts/
+.pytest_cache/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/

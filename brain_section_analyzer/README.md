@@ -199,3 +199,8 @@ From `E:\projects\cell_analyzer`:
 ```powershell
 "C:\Program Files\Python312\python.exe" -m unittest discover -s brain_section_analyzer\tests -v
 ```
+
+
+## Desktop advanced analyses and pipeline images
+
+See [Advanced analysis and processing previews](ADVANCED_ANALYSIS.md) for optional neighbour analysis, colocalization, object distances, per-cell channel measurements, radial profiles, spatial distribution, skeleton analysis, per-stage previews, plotting controls, method references and 2-D interpretation limits.

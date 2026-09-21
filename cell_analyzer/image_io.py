@@ -42,7 +42,7 @@ MICROSCOPY_FILE_PATTERN = " ".join(
 CACHE_DIRECTORY = Path(
     os.environ.get(
         "CELL_ANALYZER_CACHE_DIR",
-        Path(__file__).resolve().parent.parent / ".cache",
+        Path(__file__).resolve().parent.parent / "local_artifacts" / "cache" / "application",
     )
 ).expanduser().resolve()
 

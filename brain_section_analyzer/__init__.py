@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 
-_CACHE = Path(os.environ.get("CELL_ANALYZER_CACHE_DIR", Path(__file__).resolve().parent.parent / ".cache")).expanduser().resolve()
+_CACHE = Path(os.environ.get("CELL_ANALYZER_CACHE_DIR", Path(__file__).resolve().parent.parent / "local_artifacts" / "cache" / "application")).expanduser().resolve()
 _TEMP = _CACHE / "tmp"
 for _directory in (_CACHE, _TEMP, _CACHE / "cjdk", _CACHE / "matplotlib"):
     _directory.mkdir(parents=True, exist_ok=True)

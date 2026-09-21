@@ -31,6 +31,7 @@ from cell_analyzer.models import ChannelInfo, CziInfo
 
 def manual_config() -> dict:
     config = copy.deepcopy(DEFAULT_CONFIG)
+    config["advanced"]["neighbour_enabled"] = True
     for role in ("abeta", "iba1", "cd68"):
         config["channels"][role]["gaussian_sigma_px"] = 0
         config["channels"][role]["threshold"] = {
