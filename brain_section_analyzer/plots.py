@@ -80,6 +80,31 @@ def save_qc(path, raw_images, products, max_dimension, channel_colors, channel_n
     panels = []
     saved = {}
     selected = None if processing_steps is None else set(processing_steps)
+    qc_selected = set(selected_qc_panels)
+    group_enabled = {
+        "raw": save_raw_channels,
+        "composite": save_composite,
+        "segmentation": save_segmentation,
+        "mask": save_mask_images,
+        "stage": save_stages,
+        "advanced": save_advanced,
+    }
+
+    def requested(name, group, selection_key=None):
+        qc = path is not None and (
+            name in qc_selected
+            or (selection_key or name) in qc_selected
+            or any(
+                name.startswith(key)
+                for key in qc_selected & FEATURE_IMAGES.keys()
+            )
+        )
+        processing = (
+            processing_dir is not None
+            and group_enabled[group]
+            and (selected is None or (selection_key or name) in selected)
+        )
+        return qc, processing
 
     def boundary(image, labels, name):
         style = settings["boundaries"][name]
@@ -90,53 +115,74 @@ def save_qc(path, raw_images, products, max_dimension, channel_colors, channel_n
         return _with_ids(result, labels, settings) if labels.dtype != bool else result
 
     def add(name, title, image, group, selection_key=None):
-        panels.append((name, title, image))
-        allowed = {"raw": save_raw_channels, "composite": save_composite,
-                   "segmentation": save_segmentation, "mask": save_mask_images,
-                   "stage": save_stages, "advanced": save_advanced}[group]
-        if processing_dir is not None and allowed and (selected is None or (selection_key or name) in selected):
+        qc, processing = requested(name, group, selection_key)
+        if not (qc or processing):
+            return
+        image = image() if callable(image) else image
+        if qc:
+            panels.append((name, title, image))
+        if processing:
             processing_dir.mkdir(parents=True, exist_ok=True)
             filename = processing_dir / f"{name}.png"
             Image.fromarray(np.uint8(np.clip(image, 0, 1) * 255)).save(filename, dpi=(settings["dpi"], settings["dpi"]))
             saved[f"processing_{name}"] = str(filename)
 
     for index, role in enumerate(tinted, 1):
-        add(f"raw_channel_{index}", f"{channel_names[role]}: raw", tinted[role], "raw")
-    add("05_composite", "Composite", composite, "composite")
-    reference_overlay = boundary(tinted[reference_role], products.plaque_labels[sl], "reference")
-    reference_overlay = boundary(reference_overlay, products.neuron_like_mask[sl], "excluded")
-    reference_overlay = boundary(reference_overlay, products.microglia_absent_plaque_mask[sl], "no_nearby")
+        add(
+            f"raw_channel_{index}",
+            f"{channel_names[role]}: raw",
+            lambda role=role: tinted[role],
+            "raw",
+        )
+    add("05_composite", "Composite", lambda: composite, "composite")
+
+    def reference_panel():
+        panel = boundary(tinted[reference_role], products.plaque_labels[sl], "reference")
+        panel = boundary(panel, products.neuron_like_mask[sl], "excluded")
+        return boundary(panel, products.microglia_absent_plaque_mask[sl], "no_nearby")
+
     if products.neighbour_enabled:
-        add("06_primary_object_segmentation", f"{channel_names[reference_role]}: neighbour reference objects", reference_overlay, "segmentation")
+        add("06_primary_object_segmentation", f"{channel_names[reference_role]}: neighbour reference objects", reference_panel, "segmentation")
     for index, role in enumerate(tinted, 1):
         add(f"07_channel_{index}_objects", f"{channel_names[role]}: accepted objects",
-            boundary(tinted[role], products.marker_labels[role][sl], role), "segmentation")
+            lambda role=role: boundary(tinted[role], products.marker_labels[role][sl], role), "segmentation")
         add(f"mask_channel_{index}_object_filter_mask", f"{channel_names[role]}: accepted mask",
-            _tint((products.marker_labels[role][sl] > 0).astype(float), channel_colors[role]), "mask")
+            lambda role=role: _tint((products.marker_labels[role][sl] > 0).astype(float), channel_colors[role]), "mask")
     if products.neighbour_enabled:
         for name, mask, style in (
             ("neighbour_reference_object_mask", products.plaque_labels > 0, "reference"),
             ("neighbour_excluded_object_mask", products.neuron_like_mask, "excluded"),
             ("neighbour_no_nearby_cell_excluded", products.microglia_absent_plaque_mask, "no_nearby"),
         ):
-            add(f"mask_{name}", name.replace("_", " "), _tint(mask[sl].astype(float), to_rgb(settings["boundaries"][style]["color"])), "mask")
+            add(f"mask_{name}", name.replace("_", " "),
+                lambda mask=mask, style=style: _tint(mask[sl].astype(float), to_rgb(settings["boundaries"][style]["color"])), "mask")
     nucleus_role = cell_count_config.get("nucleus_channel")
     if cell_count_config.get("enabled") and nucleus_role in tinted:
-        panel = boundary(tinted[nucleus_role], products.nucleus_labels[sl], "nucleus")
-        panel = boundary(panel, products.microglia_labels[sl], "cell")
-        add("09_cell_counting", f"{channel_names[nucleus_role]}: detected / confirmed cells", panel, "segmentation")
+        def cell_panel():
+            panel = boundary(tinted[nucleus_role], products.nucleus_labels[sl], "nucleus")
+            return boundary(panel, products.microglia_labels[sl], "cell")
+
+        add("09_cell_counting", f"{channel_names[nucleus_role]}: detected / confirmed cells", cell_panel, "segmentation")
         for name, labels, style in (("nucleus_mask", products.nucleus_labels, "nucleus"), ("cell_mask", products.microglia_labels, "cell")):
-            add(f"mask_{name}", name.replace("_", " "), _tint((labels[sl] > 0).astype(float), to_rgb(settings["boundaries"][style]["color"])), "mask")
+            add(f"mask_{name}", name.replace("_", " "),
+                lambda labels=labels, style=style: _tint((labels[sl] > 0).astype(float), to_rgb(settings["boundaries"][style]["color"])), "mask")
     if products.ring_masks:
         union = np.zeros(shape, dtype=bool)
         for name, mask in products.ring_masks.items():
             union |= mask
-            add(f"mask_{name}", f"{name}: includes object interior", _tint(mask[sl].astype(float), to_rgb(settings["boundaries"]["ring"]["color"])), "mask", "individual_rings")
-            add(f"overlay_{name}", name, boundary(composite, mask[sl], "ring"), "segmentation", "individual_rings")
-        add("10_primary_object_distance_rings", "Cumulative neighbour ranges (interior included)", boundary(composite, union[sl], "ring"), "segmentation")
-    tissue_panel = composite.copy()
-    tissue_panel[~products.tissue_mask[sl]] *= 0.15
-    add("11_tissue_roi", "Analysis ROI", boundary(tissue_panel, products.tissue_mask[sl], "tissue"), "segmentation")
+            add(f"mask_{name}", f"{name}: includes object interior",
+                lambda mask=mask: _tint(mask[sl].astype(float), to_rgb(settings["boundaries"]["ring"]["color"])), "mask", "individual_rings")
+            add(f"overlay_{name}", name,
+                lambda mask=mask: boundary(composite, mask[sl], "ring"), "segmentation", "individual_rings")
+        add("10_primary_object_distance_rings", "Cumulative neighbour ranges (interior included)",
+            lambda: boundary(composite, union[sl], "ring"), "segmentation")
+
+    def tissue_panel():
+        panel = composite.copy()
+        panel[~products.tissue_mask[sl]] *= 0.15
+        return boundary(panel, products.tissue_mask[sl], "tissue")
+
+    add("11_tissue_roi", "Analysis ROI", tissue_panel, "segmentation")
 
     for name, (kind, array, role) in {**products.stages, **products.advanced_maps}.items():
         title = STAGE_LABELS.get(name, name.replace("_", " ").title())
@@ -144,6 +190,16 @@ def save_qc(path, raw_images, products, max_dimension, channel_colors, channel_n
         choice = name
         if group == "advanced":
             choice = next((key for key in FEATURE_IMAGES if name.startswith(key)), name)
+        if kind == "heatmap":
+            choice = "advanced_distance" if group == "advanced" else name
+        elif kind == "overlap":
+            choice = "advanced_overlap"
+        elif kind == "scatter":
+            choice = "advanced_scatter"
+        elif kind == "histogram":
+            choice = "advanced_histogram"
+        if not any(requested(name, group, choice)):
+            continue
         if kind == "image":
             panel = _tint(_display_scale(array, settings)[sl], channel_colors[role])
         elif kind == "mask":
@@ -231,10 +287,10 @@ def save_qc(path, raw_images, products, max_dimension, channel_colors, channel_n
         add(name, title, panel, group, choice)
 
     if path is not None:
-        chosen = _selected_qc_panels(panels, selected_qc_panels)
+        chosen = panels
         if not chosen:
             # An optional disabled analysis should not fail an otherwise valid run.
-            chosen = [panel for panel in panels if panel[0] == "05_composite"]
+            chosen = [("05_composite", "Composite", composite)]
         columns = min(4, len(chosen))
         rows = int(math.ceil(len(chosen) / columns))
         figure, axes = plt.subplots(rows, columns, figsize=(4.5 * columns, 4.5 * rows), squeeze=False)

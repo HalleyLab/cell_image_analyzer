@@ -188,8 +188,14 @@ def _threshold_channels(
     config: dict[str, Any],
     tissue_mask: np.ndarray,
     stages: dict | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, float | None]]:
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, float | None],
+]:
     raw_images: dict[str, np.ndarray] = {}
+    analysis_images: dict[str, np.ndarray] = {}
     masks: dict[str, np.ndarray] = {}
     thresholds: dict[str, float | None] = {}
     for position, role in enumerate(images, 1):
@@ -203,13 +209,14 @@ def _threshold_channels(
             manual_threshold=threshold_config["value"],
         )
         raw_images[role] = np.asarray(processed.raw)
+        analysis_images[role] = np.asarray(processed.analysis_image)
         masks[role] = np.asarray(mask & tissue_mask, dtype=bool)
         thresholds[role] = threshold
         if stages is not None:
             prefix = f"stage_channel_{position}"
             stages[prefix + "_gaussian"] = ("image", processed.analysis_image, role)
             stages[prefix + "_threshold"] = ("mask", masks[role], role)
-    return raw_images, masks, thresholds
+    return raw_images, analysis_images, masks, thresholds
 
 
 def _filter_marker_components(
@@ -272,6 +279,8 @@ def _filter_marker_components(
     intensity = None if intensity_image is None else np.asarray(intensity_image, dtype=float)
     for region in measure.regionprops(candidates):
         perimeter_px = float(region.perimeter)
+        solidity = float(region.solidity)
+        eccentricity = float(region.eccentricity)
         circularity = (
             4.0 * math.pi * float(region.area) / (perimeter_px * perimeter_px)
             if perimeter_px > 0
@@ -286,9 +295,9 @@ def _filter_marker_components(
                 reasons.append("above_max_area")
             if circularity < float(object_filter.get("min_circularity", 0.0)):
                 reasons.append("below_min_circularity")
-            if float(region.solidity) < float(object_filter.get("min_solidity", 0.0)):
+            if solidity < float(object_filter.get("min_solidity", 0.0)):
                 reasons.append("below_min_solidity")
-            if float(region.eccentricity) > float(
+            if eccentricity > float(
                 object_filter.get("max_eccentricity", 1.0)
             ):
                 reasons.append("above_max_eccentricity")
@@ -314,8 +323,8 @@ def _filter_marker_components(
                 * math.sqrt(area_um2 / math.pi),
                 "component_perimeter_px": perimeter_px,
                 "component_circularity": circularity,
-                "component_solidity": float(region.solidity),
-                "component_eccentricity": float(region.eccentricity),
+                "component_solidity": solidity,
+                "component_eccentricity": eccentricity,
                 "component_mean_intensity": (
                     float(values.mean()) if values.size else float("nan")
                 ),
@@ -324,9 +333,9 @@ def _filter_marker_components(
                 ),
             }
         )
-    labels = np.zeros(candidates.shape, dtype=np.int32)
-    for new_label, old_label in enumerate(accepted_ids, start=1):
-        labels[candidates == old_label] = new_label
+    label_map = np.zeros(int(candidates.max()) + 1, dtype=np.int32)
+    label_map[accepted_ids] = np.arange(1, len(accepted_ids) + 1, dtype=np.int32)
+    labels = label_map[candidates]
     table = pd.DataFrame.from_records(records)
     if table.empty:
         table = pd.DataFrame(
@@ -507,8 +516,8 @@ def _segment_microglia_nuclei(
         0, int(math.ceil(float(settings["perinuclear_radius_um"]) / mean_pixel_um))
     )
     footprint = morphology.disk(radius_px) if radius_px else None
-    nucleus_labels = np.zeros(candidates.shape, dtype=np.int32)
-    microglia_labels = np.zeros(candidates.shape, dtype=np.int32)
+    nucleus_map = np.zeros(int(candidates.max()) + 1, dtype=np.int32)
+    microglia_map = np.zeros(int(candidates.max()) + 1, dtype=np.int32)
     records: list[dict[str, Any]] = []
     nucleus_id = 0
     cell_id = 0
@@ -516,6 +525,8 @@ def _segment_microglia_nuclei(
     for region in measure.regionprops(candidates, intensity_image=nucleus_image):
         area_um2 = float(region.area) * pixel_area_um2
         perimeter = float(region.perimeter)
+        solidity = float(region.solidity)
+        eccentricity = float(region.eccentricity)
         circularity = (
             4.0 * math.pi * float(region.area) / (perimeter * perimeter)
             if perimeter > 0
@@ -529,9 +540,9 @@ def _segment_microglia_nuclei(
             reasons.append("above_max_nucleus_area")
         if circularity < float(settings["min_circularity"]):
             reasons.append("below_min_circularity")
-        if float(region.solidity) < float(settings["min_solidity"]):
+        if solidity < float(settings["min_solidity"]):
             reasons.append("below_min_solidity")
-        if float(region.eccentricity) > float(settings["max_eccentricity"]):
+        if eccentricity > float(settings["max_eccentricity"]):
             reasons.append("above_max_eccentricity")
         accepted_nucleus = not reasons
 
@@ -564,12 +575,12 @@ def _segment_microglia_nuclei(
             )
         if accepted_nucleus:
             nucleus_id += 1
-            nucleus_labels[candidates == int(region.label)] = nucleus_id
+            nucleus_map[int(region.label)] = nucleus_id
             if not accepted_microglia:
                 reasons.append("below_min_confirmation_fraction")
         if accepted_microglia:
             cell_id += 1
-            microglia_labels[candidates == int(region.label)] = cell_id
+            microglia_map[int(region.label)] = cell_id
 
         row = int(np.clip(round(region.centroid[0]), 0, cleaned.shape[0] - 1))
         column = int(np.clip(round(region.centroid[1]), 0, cleaned.shape[1] - 1))
@@ -597,8 +608,8 @@ def _segment_microglia_nuclei(
                 "centroid_x_um": float(region.centroid[1]) * pixel_size_um_x,
                 "nucleus_area_um2": area_um2,
                 "nucleus_circularity": circularity,
-                "nucleus_solidity": float(region.solidity),
-                "nucleus_eccentricity": float(region.eccentricity),
+                "nucleus_solidity": solidity,
+                "nucleus_eccentricity": eccentricity,
                 "nucleus_mean_intensity": float(region.intensity_mean),
                 "perinuclear_area_um2": int(local_zone.sum()) * pixel_area_um2,
                 "perinuclear_confirmation_positive_area_um2": confirmation_area_um2,
@@ -620,6 +631,8 @@ def _segment_microglia_nuclei(
         "perinuclear_confirmation_positive_fraction", "nearest_plaque_id",
         "distance_to_nearest_plaque_um", "distance_ring",
     ]
+    nucleus_labels = nucleus_map[candidates]
+    microglia_labels = microglia_map[candidates]
     table = pd.DataFrame.from_records(records)
     if stages is not None:
         stages["stage_nucleus_candidates"] = ("labels", candidates, nucleus_role)
@@ -825,9 +838,9 @@ def _segment_plaque_candidates(
         if float(region.eccentricity) > float(plaque_config.get("max_eccentricity", 1.0)):
             continue
         keep.append(int(region.label))
-    labels = np.zeros(candidates.shape, dtype=np.int32)
-    for new_label, old_label in enumerate(keep, start=1):
-        labels[candidates == old_label] = new_label
+    label_map = np.zeros(int(candidates.max()) + 1, dtype=np.int32)
+    label_map[keep] = np.arange(1, len(keep) + 1, dtype=np.int32)
+    labels = label_map[candidates]
     candidate_qc = pd.DataFrame.from_records(candidate_records)
     if candidate_qc.empty:
         candidate_qc = pd.DataFrame(
@@ -1038,6 +1051,86 @@ def _mask_metrics(
     return result
 
 
+def _labeled_mask_metrics(
+    labels: np.ndarray,
+    label_count: int,
+    positive_masks: dict[str, np.ndarray],
+    raw_images: dict[str, np.ndarray],
+    pixel_area_um2: float,
+    *,
+    region_mask: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Compute every object''s mask metrics with one image scan per channel."""
+
+    flat_labels = np.asarray(labels).ravel()
+    active = flat_labels > 0
+    if region_mask is not None:
+        active &= np.asarray(region_mask, dtype=bool).ravel()
+    size = int(label_count) + 1
+    region_pixels = np.bincount(flat_labels[active], minlength=size).astype(float)
+
+    def ratio(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+        result = np.full(size, np.nan, dtype=float)
+        np.divide(numerator, denominator, out=result, where=denominator > 0)
+        return result
+
+    metrics: dict[str, np.ndarray] = {
+        "area_um2": region_pixels * pixel_area_um2
+    }
+    positive_counts: dict[str, np.ndarray] = {}
+    flat_positive: dict[str, np.ndarray] = {}
+    for role, mask in positive_masks.items():
+        flat_positive[role] = np.asarray(mask, dtype=bool).ravel()
+        selected = active & flat_positive[role]
+        selected_labels = flat_labels[selected]
+        counts = np.bincount(selected_labels, minlength=size).astype(float)
+        intensity = np.asarray(raw_images[role]).ravel()
+        sums = np.bincount(
+            selected_labels,
+            weights=intensity[selected],
+            minlength=size,
+        )
+        positive_counts[role] = counts
+        metrics[f"{role}_positive_area_um2"] = counts * pixel_area_um2
+        metrics[f"{role}_positive_fraction"] = ratio(counts, region_pixels)
+        metrics[f"{role}_thresholded_integrated_intensity"] = sums
+        metrics[f"{role}_thresholded_mean_intensity"] = ratio(sums, region_pixels)
+        metrics[f"{role}_positive_mean_intensity"] = ratio(sums, counts)
+
+    for name, roles in (
+        ("cd68_in_iba1", ("cd68", "iba1")),
+        ("abeta_in_cd68", ("abeta", "cd68")),
+        ("abeta_in_iba1", ("abeta", "iba1")),
+    ):
+        if not set(roles) <= flat_positive.keys():
+            continue
+        selected = active & flat_positive[roles[0]] & flat_positive[roles[1]]
+        counts = np.bincount(flat_labels[selected], minlength=size).astype(float)
+        metrics[f"{name}_area_um2"] = counts * pixel_area_um2
+
+    if "cd68_in_iba1_area_um2" in metrics:
+        metrics["cd68_in_iba1_fraction_of_iba1"] = ratio(
+            metrics["cd68_in_iba1_area_um2"],
+            metrics["iba1_positive_area_um2"],
+        )
+    for container in ("cd68", "iba1"):
+        key = f"abeta_in_{container}_area_um2"
+        if key in metrics:
+            metrics[f"abeta_in_{container}_fraction_of_{container}"] = ratio(
+                metrics[key], metrics[f"{container}_positive_area_um2"]
+            )
+            metrics[f"abeta_in_{container}_fraction_of_abeta"] = ratio(
+                metrics[key], metrics["abeta_positive_area_um2"]
+            )
+    return metrics
+
+
+def _metrics_for_label(
+    metrics: dict[str, np.ndarray], label: int
+) -> dict[str, float]:
+    return {name: float(values[label]) for name, values in metrics.items()}
+
+
 def _prefixed(target: dict[str, Any], prefix: str, values: dict[str, Any]) -> None:
     for key, value in values.items():
         target[f"{prefix}_{key}"] = value
@@ -1116,7 +1209,9 @@ def analyze_arrays(
 
     tissue = _tissue_mask(config, shape)
     stages = {"stage_tissue": ("mask", tissue, None)}
-    raw_images, positive_masks, thresholds = _threshold_channels(images, config, tissue, stages)
+    raw_images, analysis_images, positive_masks, thresholds = _threshold_channels(
+        images, config, tissue, stages
+    )
     neighbour_enabled = config.get("advanced", {}).get("neighbour_enabled", True)
 
     # Every enabled channel is filtered independently after thresholding.
@@ -1139,9 +1234,7 @@ def analyze_arrays(
     marker_component_qc = pd.concat(marker_tables, ignore_index=True, sort=False)
 
     reference_role = config["plaque"].get("reference_channel", "abeta") if neighbour_enabled else next(iter(marker_labels))
-    reference_detection_image = preprocess_channel(
-        images[reference_role], config["channels"][reference_role]
-    ).analysis_image
+    reference_detection_image = analysis_images[reference_role]
     plaque_mask, plaque_labels, neuron_like_mask, candidate_qc = _segment_plaque_candidates(
         positive_masks[reference_role] if neighbour_enabled else np.zeros(shape, dtype=bool),
         config,
@@ -1237,9 +1330,9 @@ def analyze_arrays(
             for plaque_id, count in nearby_microglia_counts.items()
             if count >= minimum_nearby_microglia
         ]
-        filtered_labels = np.zeros(shape, dtype=np.int32)
-        for new_id, old_id in enumerate(keep, start=1):
-            filtered_labels[plaque_labels == old_id] = new_id
+        label_map = np.zeros(int(plaque_labels.max()) + 1, dtype=np.int32)
+        label_map[keep] = np.arange(1, len(keep) + 1, dtype=np.int32)
+        filtered_labels = label_map[plaque_labels]
         nearby_microglia_counts = {
             new_id: nearby_microglia_counts[old_id]
             for new_id, old_id in enumerate(keep, start=1)
@@ -1377,6 +1470,41 @@ def analyze_arrays(
             else float("nan")
         )
 
+    plaque_count = int(plaque_labels.max())
+    plaque_metric_arrays = _labeled_mask_metrics(
+        plaque_labels,
+        plaque_count,
+        positive_masks,
+        raw_images,
+        pixel_area_um2,
+    )
+    ring_metric_arrays = {
+        name: _labeled_mask_metrics(
+            nearest_labels,
+            plaque_count,
+            positive_masks,
+            raw_images,
+            pixel_area_um2,
+            region_mask=mask,
+        )
+        for name, mask in ring_masks.items()
+    }
+    ring_cell_counts: dict[str, np.ndarray] = {}
+    if microglia_enabled:
+        accepted_values = accepted_microglia.to_numpy(dtype=bool)
+        nearest_values = microglia_nearest.to_numpy(dtype=float)
+        distance_values = microglia_distance.to_numpy(dtype=float)
+        for name, outer in _ring_specs(edges):
+            selected = (
+                accepted_values
+                & np.isfinite(nearest_values)
+                & (nearest_values > 0)
+                & (distance_values <= outer)
+            )
+            ring_cell_counts[name] = np.bincount(
+                nearest_values[selected].astype(int), minlength=plaque_count + 1
+            )
+
     plaque_records: list[dict[str, Any]] = []
     mean_pixel_um = (pixel_size_um_x + pixel_size_um_y) / 2.0
     for region in all_regions:
@@ -1384,7 +1512,6 @@ def analyze_arrays(
         touches_boundary = plaque_id in boundary_labels
         if exclude_boundary and touches_boundary:
             continue
-        region_mask = plaque_labels == plaque_id
         area_um2 = float(region.area) * pixel_area_um2
         perimeter_um = float(region.perimeter) * mean_pixel_um
         record: dict[str, Any] = {
@@ -1407,35 +1534,31 @@ def analyze_arrays(
             "plaque_eccentricity": float(region.eccentricity),
             f"{reference_role}_mean_intensity_in_plaque": float(region.intensity_mean),
             f"{reference_role}_integrated_intensity_in_plaque": float(
-                np.asarray(raw_images[reference_role], dtype=float)[region_mask].sum()
+                np.asarray(region.image_intensity)[region.image].sum()
             ),
         }
         for key, value in config.get("metadata", {}).items():
             record[key] = value
-        _prefixed(record, "plaque", _mask_metrics(region_mask, positive_masks, raw_images, pixel_area_um2))
+        _prefixed(
+            record,
+            "plaque",
+            _metrics_for_label(plaque_metric_arrays, plaque_id),
+        )
         record["nearby_microglia_count"] = (
             nearby_microglia_counts.get(plaque_id, 0)
             if microglia_enabled
             else float("nan")
         )
         for name, outer in _ring_specs(edges):
-            plaque_ring = ring_masks[name] & (nearest_labels == plaque_id)
-            _prefixed(record, name, _mask_metrics(plaque_ring, positive_masks, raw_images, pixel_area_um2))
+            ring_metrics = _metrics_for_label(ring_metric_arrays[name], plaque_id)
+            _prefixed(record, name, ring_metrics)
             plaque_cell_count = (
-                int(
-                    (
-                        accepted_microglia
-                        & (microglia_nearest == plaque_id)
-                        & (microglia_distance <= outer)
-                    ).sum()
-                )
+                int(ring_cell_counts[name][plaque_id])
                 if microglia_enabled
                 else float("nan")
             )
             record[f"{name}_microglia_count"] = plaque_cell_count
-            plaque_ring_area_mm2 = (
-                int(plaque_ring.sum()) * pixel_area_um2 / 1_000_000.0
-            )
+            plaque_ring_area_mm2 = ring_metrics["area_um2"] / 1_000_000.0
             record[f"{name}_microglia_density_per_mm2"] = (
                 _safe_ratio(plaque_cell_count, plaque_ring_area_mm2)
                 if microglia_enabled

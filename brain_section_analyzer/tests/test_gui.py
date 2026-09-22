@@ -11,6 +11,30 @@ from brain_section_analyzer.gui import BrainSectionGui
 
 
 class SessionButtonTests(unittest.TestCase):
+    def test_compact_sections_expand_without_losing_controls(self):
+        root = TkinterDnD.Tk()
+        root.withdraw()
+        try:
+            gui = BrainSectionGui(root)
+            self.assertEqual(int(gui.file_list.cget("height")), 4)
+            self.assertFalse(gui.calibration_visible)
+            self.assertFalse(gui.microglia_vars["enabled"].get())
+            self.assertFalse(gui.log_visible)
+            self.assertEqual(gui.log.winfo_manager(), "")
+            self.assertEqual(
+                [gui.output_settings.tab(tab, "text") for tab in gui.output_settings.tabs()],
+                ["Tables", "Images"],
+            )
+            gui._toggle_calibration()
+            gui.microglia_vars["enabled"].set(True)
+            gui._update_cell_count_visibility()
+            gui._toggle_log()
+            self.assertTrue(gui.calibration_visible)
+            self.assertTrue(gui.log_visible)
+            self.assertEqual(gui.log.winfo_manager(), "pack")
+        finally:
+            root.destroy()
+
     def test_session_buttons_keep_symmetric_centered_layout_at_different_scales(self):
         for scaling in (1.0, 1.333333333, 2.0):
             with self.subTest(scaling=scaling):

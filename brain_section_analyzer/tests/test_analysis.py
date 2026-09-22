@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,11 +16,14 @@ from brain_section_analyzer.analysis import (
     _overlay,
     _selected_qc_panels,
     _clean_and_label_plaques,
+    _labeled_mask_metrics,
+    _mask_metrics,
     _plaque_ring_metrics_table,
     _select_output_columns,
     _write_outputs,
     analyze_arrays,
 )
+from brain_section_analyzer.plots import save_qc
 from brain_section_analyzer.gui import _preview_image_choices
 from brain_section_analyzer.config import (
     DEFAULT_CONFIG,
@@ -54,6 +58,80 @@ def manual_config() -> dict:
 
 
 class BrainSectionAnalysisTests(unittest.TestCase):
+    def test_labeled_metrics_match_individual_masks(self) -> None:
+        labels = np.array(
+            [[1, 1, 0, 0], [1, 0, 2, 2], [0, 0, 2, 0]],
+            dtype=np.int32,
+        )
+        images = {
+            "abeta": np.arange(labels.size, dtype=np.uint16).reshape(labels.shape),
+            "iba1": np.full(labels.shape, 7, dtype=np.uint16),
+            "cd68": np.full(labels.shape, 3, dtype=np.uint16),
+        }
+        masks = {
+            "abeta": images["abeta"] > 2,
+            "iba1": labels > 0,
+            "cd68": (np.indices(labels.shape)[1] % 2) == 0,
+        }
+        combined = _labeled_mask_metrics(labels, 2, masks, images, 0.5)
+        for label in (1, 2):
+            expected = _mask_metrics(labels == label, masks, images, 0.5)
+            for name, value in expected.items():
+                actual = float(combined[name][label])
+                if np.isnan(value):
+                    self.assertTrue(np.isnan(actual), name)
+                else:
+                    self.assertAlmostEqual(actual, value, msg=name)
+
+    def test_reference_channel_is_preprocessed_once(self) -> None:
+        import brain_section_analyzer.analysis as analysis_module
+
+        images = {
+            role: np.zeros((16, 16), dtype=np.uint16)
+            for role in ("abeta", "iba1", "cd68")
+        }
+        with patch.object(
+            analysis_module,
+            "preprocess_channel",
+            wraps=analysis_module.preprocess_channel,
+        ) as wrapped:
+            analyze_arrays(
+                images,
+                manual_config(),
+                pixel_size_um_x=1,
+                pixel_size_um_y=1,
+            )
+        self.assertEqual(wrapped.call_count, len(images))
+
+    def test_renderer_builds_only_selected_processing_image(self) -> None:
+        images = {
+            role: np.zeros((16, 16), dtype=np.uint16)
+            for role in ("abeta", "iba1", "cd68")
+        }
+        images["abeta"][4:8, 4:8] = 20
+        config = manual_config()
+        products = analyze_arrays(
+            images, config, pixel_size_um_x=1, pixel_size_um_y=1
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "brain_section_analyzer.plots.segmentation.find_boundaries",
+            side_effect=AssertionError("unselected overlays must not render"),
+        ):
+            files = save_qc(
+                None,
+                images,
+                products,
+                2200,
+                {role: (1.0, 1.0, 1.0) for role in images},
+                {role: role for role in images},
+                config["microglia_count"],
+                "abeta",
+                [],
+                Path(directory),
+                processing_steps=["05_composite"],
+            )
+        self.assertIn("processing_05_composite", files)
+
     def test_overlay_line_width_expands_boundary_without_changing_background(self) -> None:
         image = np.zeros((7, 7, 3), dtype=float)
         boundary = np.zeros((7, 7), dtype=bool)

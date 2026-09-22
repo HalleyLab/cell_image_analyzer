@@ -131,7 +131,8 @@ class BrainSectionGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Cell Analyzer")
-        self.root.geometry("1380x980")
+        self.root.geometry("1280x840")
+        self.root.minsize(1050, 700)
         self.image_paths: list[Path] = []
         self.info = None
         self.active_roles = list(roles_for_count(4))
@@ -183,26 +184,37 @@ class BrainSectionGui:
         return widgets
 
     def _build(self) -> None:
-        outer = ttk.Frame(self.root, padding=10)
+        outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill="both", expand=True)
+        style = ttk.Style(self.root)
+        style.configure("TButton", padding=(8, 5))
+        style.configure("TNotebook.Tab", padding=(12, 6))
 
-        files_frame = ttk.LabelFrame(outer, text="Input microscopy images", padding=8)
-        files_frame.pack(fill="x")
-        self.file_list = tk.Listbox(files_frame, height=6, selectmode="extended")
-        self.file_list.grid(row=0, column=0, rowspan=5, sticky="nsew")
+        setup = ttk.Frame(outer)
+        setup.pack(fill="x")
+        files_frame = ttk.LabelFrame(setup, text="Images", padding=7)
+        files_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.file_list = tk.Listbox(files_frame, height=4, selectmode="extended")
+        self.file_list.grid(row=0, column=0, columnspan=4, sticky="nsew")
         scrollbar = ttk.Scrollbar(files_frame, orient="vertical", command=self.file_list.yview)
-        scrollbar.grid(row=0, column=1, rowspan=5, sticky="ns")
+        scrollbar.grid(row=0, column=4, sticky="ns")
         self.file_list.configure(yscrollcommand=scrollbar.set)
         self.file_list.drop_target_register(DND_FILES)
         self.file_list.dnd_bind("<<Drop>>", self._drop_images)
-        ttk.Button(files_frame, text="Add images", command=self._add_images).grid(row=0, column=2, sticky="ew", padx=6)
-        ttk.Button(files_frame, text="Inspect selected image", command=self._inspect_selected).grid(row=1, column=2, sticky="ew", padx=6)
-        ttk.Button(files_frame, text="Remove selected", command=self._remove_images).grid(row=2, column=2, sticky="ew", padx=6)
-        ttk.Button(files_frame, text="Clear", command=self._clear_images).grid(row=3, column=2, sticky="ew", padx=6)
+        for column, (label, command) in enumerate((
+            ("Add images", self._add_images),
+            ("Inspect", self._inspect_selected),
+            ("Remove", self._remove_images),
+            ("Clear", self._clear_images),
+        )):
+            ttk.Button(files_frame, text=label, command=command).grid(
+                row=1, column=column, sticky="ew", padx=(0 if column == 0 else 3, 0), pady=(6, 0)
+            )
+            files_frame.columnconfigure(column, weight=1)
         files_frame.columnconfigure(0, weight=1)
 
-        output_frame = ttk.LabelFrame(outer, text="Output and sample metadata", padding=8)
-        output_frame.pack(fill="x", pady=(8, 0))
+        output_frame = ttk.LabelFrame(setup, text="Folders", padding=7)
+        output_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         self.output_root = tk.StringVar()
         self.cache_root = tk.StringVar()
         self.metadata_csv = tk.StringVar()
@@ -216,9 +228,11 @@ class BrainSectionGui:
         ttk.Entry(output_frame, textvariable=self.metadata_csv).grid(row=2, column=1, sticky="ew", padx=4)
         ttk.Button(output_frame, text="Browse", command=self._browse_metadata).grid(row=2, column=2)
         output_frame.columnconfigure(1, weight=1)
+        setup.columnconfigure(0, weight=3)
+        setup.columnconfigure(1, weight=2)
 
         self.metadata_label = ttk.Label(
-            outer, text="Add images, then inspect one to load channels and pixel size.", wraplength=1320
+            outer, text="Add images, then inspect one to load channels and pixel size.", wraplength=1200
         )
         self.metadata_label.pack(fill="x", pady=(6, 2))
 
@@ -245,7 +259,6 @@ class BrainSectionGui:
 
         controls = ttk.Frame(outer, padding=(0, 6))
         controls.pack(fill="x", pady=(8, 0))
-        style = ttk.Style(self.root)
         style.configure(
             "Session.TButton", anchor="center", justify="center",
             padding=(12, 8, 12, 8), width=18,
@@ -269,10 +282,22 @@ class BrainSectionGui:
             button.pack(side="left", padx=3)
             self.session_buttons.append(button)
         self.status = tk.StringVar(value="Ready")
-        ttk.Label(controls, textvariable=self.status).pack(side="left", padx=12)
+        ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(controls, textvariable=self.status).pack(side="left", padx=4, fill="x", expand=True)
+        self.log_button = ttk.Button(controls, text="Show log", command=self._toggle_log)
+        self.log_button.pack(side="right")
 
-        self.log = tk.Text(outer, height=6, wrap="word", state="disabled")
-        self.log.pack(fill="x", pady=(6, 0))
+        self.log = tk.Text(outer, height=5, wrap="word", state="disabled")
+        self.log_visible = False
+
+    def _toggle_log(self) -> None:
+        self.log_visible = not self.log_visible
+        if self.log_visible:
+            self.log.pack(fill="x", pady=(6, 0))
+            self.log_button.configure(text="Hide log")
+        else:
+            self.log.pack_forget()
+            self.log_button.configure(text="Show log")
 
     def _build_input_tab(self, parent: ttk.Frame) -> None:
         self.input_vars = {
@@ -299,12 +324,31 @@ class BrainSectionGui:
                 ("Z index", "z_index", None),
                 ("Analysis zoom", "zoom", None),
                 ("Preview zoom", "preview_zoom", None),
-                ("X µm/pixel (if metadata is missing)", "pixel_size_um_x", None),
-                ("Y µm/pixel (if metadata is missing)", "pixel_size_um_y", None),
-                ("Whole-image width µm (optional)", "image_width_um", None),
-                ("Whole-image height µm (optional)", "image_height_um", None),
             ],
         )
+        self.calibration_button = ttk.Button(
+            image_frame, text="Manual calibration...", command=self._toggle_calibration
+        )
+        self.calibration_button.grid(row=6, column=0, columnspan=2, sticky="w", padx=5, pady=(8, 2))
+        self.calibration_frame = ttk.LabelFrame(parent, text="Manual calibration override", padding=8)
+        self.calibration_frame.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self._entry_grid(
+            self.calibration_frame,
+            self.input_vars,
+            [
+                ("X µm/pixel", "pixel_size_um_x", None),
+                ("Y µm/pixel", "pixel_size_um_y", None),
+                ("Whole-image width µm", "image_width_um", None),
+                ("Whole-image height µm", "image_height_um", None),
+            ],
+        )
+        ttk.Label(
+            self.calibration_frame,
+            text="Used only when physical pixel-size metadata is unavailable.",
+            wraplength=430,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(7, 0))
+        self.calibration_visible = False
+        self.calibration_frame.grid_remove()
 
         self.roi_vars = {
             "mode": tk.StringVar(value="full_image"),
@@ -334,6 +378,24 @@ class BrainSectionGui:
         ).grid(row=5, column=0, columnspan=2, sticky="w", padx=5)
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=1)
+
+    def _set_calibration_visible(self, visible: bool) -> None:
+        self.calibration_visible = visible
+        if visible:
+            self.calibration_frame.grid()
+            self.calibration_button.configure(text="Hide manual calibration")
+        else:
+            self.calibration_frame.grid_remove()
+            calibration_set = any(
+                self.input_vars[key].get().strip()
+                for key in ("pixel_size_um_x", "pixel_size_um_y", "image_width_um", "image_height_um")
+            )
+            self.calibration_button.configure(
+                text="Manual calibration (set)..." if calibration_set else "Manual calibration..."
+            )
+
+    def _toggle_calibration(self) -> None:
+        self._set_calibration_visible(not self.calibration_visible)
 
     @staticmethod
     def _pick_color(variable: tk.StringVar) -> None:
@@ -422,22 +484,20 @@ class BrainSectionGui:
             frame = ttk.Frame(container, padding=(0, 6))
             frame.grid(row=0, column=0, sticky="nsew")
             self.object_filter_frames[role] = frame
-            self._entry_grid(
-                frame,
-                variables,
-                [
-                    ("Enable object filtering", "enabled", None),
-                    ("Open px", "opening_radius_px", None),
-                    ("Close px", "closing_radius_px", None),
-                    ("Fill holes", "fill_holes", None),
-                    ("Maximum filled-hole area µm²", "max_hole_area_um2", None),
-                    ("Minimum area µm²", "min_area_um2", None),
-                    ("Maximum area µm² (blank = unlimited)", "max_area_um2", None),
-                    ("Minimum circularity", "min_circularity", None),
-                    ("Minimum solidity", "min_solidity", None),
-                    ("Maximum eccentricity", "max_eccentricity", None),
-                ],
-            )
+            fields = [
+                ("Enable object filtering", "enabled", None),
+                ("Open px", "opening_radius_px", None),
+                ("Close px", "closing_radius_px", None),
+                ("Fill holes", "fill_holes", None),
+                ("Maximum filled-hole area µm²", "max_hole_area_um2", None),
+                ("Minimum area µm²", "min_area_um2", None),
+                ("Maximum area µm² (blank = unlimited)", "max_area_um2", None),
+                ("Minimum circularity", "min_circularity", None),
+                ("Minimum solidity", "min_solidity", None),
+                ("Maximum eccentricity", "max_eccentricity", None),
+            ]
+            self._entry_grid(frame, variables, fields[:5])
+            self._entry_grid(frame, variables, fields[5:], column=2)
         self._show_object_filter_channel()
 
     def _show_object_filter_channel(self, _event: Any = None) -> None:
@@ -845,15 +905,23 @@ class BrainSectionGui:
             "perinuclear_radius_um": tk.StringVar(value="3"),
             "min_confirmation_positive_fraction": tk.StringVar(value="0.15"),
         }
-        frame = ttk.LabelFrame(parent, text="Cell detection", padding=8)
-        frame.grid(row=0, column=0, sticky="nsew")
+        ttk.Checkbutton(
+            parent,
+            text="Enable cell counting",
+            variable=self.microglia_vars["enabled"],
+            command=self._update_cell_count_visibility,
+        ).grid(row=0, column=0, sticky="w", padx=5, pady=(2, 8))
+        self.cell_count_details = ttk.Frame(parent)
+        self.cell_count_details.grid(row=1, column=0, sticky="nsew")
+        segmentation = ttk.LabelFrame(self.cell_count_details, text="Nucleus segmentation", padding=8)
+        segmentation.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        confirmation = ttk.LabelFrame(self.cell_count_details, text="Confirmation and splitting", padding=8)
+        confirmation.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         widgets = self._entry_grid(
-            frame,
+            segmentation,
             self.microglia_vars,
             [
-                ("Enable cell counting", "enabled", None),
                 ("Nucleus channel", "nucleus_channel", ("", *ROLE_LABELS.values())),
-                ("Confirmation channel (optional)", "confirmation_channel", ("", *ROLE_LABELS.values())),
                 ("Nucleus open px", "opening_radius_px", None),
                 ("Nucleus close px", "closing_radius_px", None),
                 ("Fill nucleus holes", "fill_holes", None),
@@ -862,18 +930,36 @@ class BrainSectionGui:
                 ("Minimum nucleus circularity", "min_circularity", None),
                 ("Minimum nucleus solidity", "min_solidity", None),
                 ("Maximum nucleus eccentricity", "max_eccentricity", None),
+            ],
+        )
+        widgets.update(self._entry_grid(
+            confirmation,
+            self.microglia_vars,
+            [
+                ("Confirmation channel (optional)", "confirmation_channel", ("", *ROLE_LABELS.values())),
                 ("Split touching nuclei", "split_touching", None),
                 ("Minimum nucleus peak distance px", "min_peak_distance_px", None),
                 ("Perinuclear radius µm", "perinuclear_radius_um", None),
                 ("Minimum confirmation-positive fraction", "min_confirmation_positive_fraction", None),
             ],
-        )
+        ))
         self.cell_channel_widgets = [widgets["nucleus_channel"], widgets["confirmation_channel"]]
-        ttk.Label(
-            parent,
+        self.cell_count_hint = ttk.Label(
+            self.cell_count_details,
             text="Choose any enabled nucleus channel. Leave confirmation blank to count by nucleus morphology only.",
             wraplength=700,
-        ).grid(row=1, column=0, sticky="w", padx=5, pady=10)
+        )
+        self.cell_count_hint.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=10)
+        self.cell_count_details.columnconfigure(0, weight=1)
+        self.cell_count_details.columnconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
+        self._update_cell_count_visibility()
+
+    def _update_cell_count_visibility(self) -> None:
+        if self.microglia_vars["enabled"].get():
+            self.cell_count_details.grid()
+        else:
+            self.cell_count_details.grid_remove()
 
     def _build_output_tab(self, parent: ttk.Frame) -> None:
         self.output_vars = {
@@ -907,8 +993,12 @@ class BrainSectionGui:
             for key, value in DRAWING_DEFAULTS["boundaries"].items()
         }
         self.boundary_vars["ring"]["width_px"] = self.output_vars["ring_boundary_width_px"]
-        table_frame = ttk.LabelFrame(parent, text="Table columns", padding=8)
-        table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.output_settings = ttk.Notebook(parent)
+        self.output_settings.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        table_frame = ttk.Frame(self.output_settings, padding=8)
+        image_frame = ttk.Frame(self.output_settings, padding=8)
+        self.output_settings.add(table_frame, text="Tables")
+        self.output_settings.add(image_frame, text="Images")
         ttk.Label(
             table_frame,
             text="Run a preview to load the exact parameters produced by the current settings.",
@@ -930,8 +1020,6 @@ class BrainSectionGui:
             wraplength=250,
         ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
-        image_frame = ttk.LabelFrame(parent, text="Images and masks", padding=8)
-        image_frame.grid(row=0, column=1, sticky="nsew", padx=5)
         image_outputs = (
             ("Overview QC image", "save_qc"),
             ("Raw channel preview images", "save_raw_channel_images"),
@@ -947,26 +1035,25 @@ class BrainSectionGui:
             ("Nucleus / cell label TIFFs", "save_cell_labels"),
             ("Positive-mask TIFF", "save_positive_masks"),
         )
-        for row, (label, key) in enumerate(image_outputs):
+        image_rows = (len(image_outputs) + 1) // 2
+        for index, (label, key) in enumerate(image_outputs):
+            row, column = index % image_rows, index // image_rows
             ttk.Checkbutton(image_frame, text=label, variable=self.output_vars[key]).grid(
-                row=row, column=0, sticky="w", pady=2
+                row=row, column=column, sticky="w", padx=(0, 10), pady=2
             )
-        ttk.Label(
-            image_frame,
-            text="PNG image choices also control generated previews.",
-            wraplength=230,
-        ).grid(row=len(image_outputs), column=0, sticky="w", pady=(8, 0))
         qc_menu_button = ttk.Button(image_frame, text="Overview QC panels...", command=self._choose_qc_panels)
-        qc_menu_button.grid(row=len(image_outputs) + 1, column=0, sticky="w", pady=(8, 0))
+        qc_menu_button.grid(row=image_rows + 1, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(image_frame, text="Choose processing images...", command=self._choose_processing_images).grid(
+            row=image_rows + 1, column=1, sticky="w", pady=(8, 0)
+        )
         self.qc_panel_status = tk.StringVar()
         ttk.Label(image_frame, textvariable=self.qc_panel_status).grid(
-            row=len(image_outputs) + 2, column=0, sticky="w", pady=(4, 0)
+            row=image_rows + 2, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
         self._update_qc_panel_status()
-        ttk.Button(image_frame, text="Choose processing images...", command=self._choose_processing_images).grid(row=len(image_outputs) + 3, column=0, sticky="w", pady=6)
 
         preview_frame = ttk.LabelFrame(parent, text="Processed preview", padding=8)
-        preview_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        preview_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         self.preview_label = tk.Label(
             preview_frame,
             text="Select an image, then run Preview selected image.",
@@ -1016,7 +1103,7 @@ class BrainSectionGui:
         preview_frame.columnconfigure(0, weight=1)
 
         run_frame = ttk.LabelFrame(parent, text="Run", padding=8)
-        run_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        run_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.preview_button = ttk.Button(
             run_frame, text="Preview selected image", command=self._preview
         )
@@ -1039,7 +1126,7 @@ class BrainSectionGui:
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(7, 0))
 
         parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(2, weight=1)
+        parent.columnconfigure(1, weight=1)
 
     def _drawing_config(self):
         result = {key: variable.get() for key, variable in self.drawing_vars.items()}
@@ -1654,6 +1741,14 @@ class BrainSectionGui:
         ):
             value = input_config.get(key, default)
             self.input_vars[key].set("" if value is None else str(value))
+        if not self.calibration_visible:
+            calibration_set = any(
+                self.input_vars[key].get().strip()
+                for key in ("pixel_size_um_x", "pixel_size_um_y", "image_width_um", "image_height_um")
+            )
+            self.calibration_button.configure(
+                text="Manual calibration (set)..." if calibration_set else "Manual calibration..."
+            )
         for position, role in enumerate(self.active_roles):
             item = config.get("channels", {}).get(role, {})
             variables = self.channel_vars[role]
@@ -1693,6 +1788,7 @@ class BrainSectionGui:
                 variable.set(ROLE_LABELS.get(value, ""))
             else:
                 variable.set("" if value is None else value)
+        self._update_cell_count_visibility()
         output = config.get("output", {})
         for key, default in OUTPUT_SELECTION_DEFAULTS.items():
             self.output_vars[key].set(output.get(key, default))
