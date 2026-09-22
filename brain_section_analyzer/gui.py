@@ -127,6 +127,36 @@ def _preview_image_choices(files: dict[str, Any]) -> dict[str, Path]:
     return choices
 
 
+def _bind_drag_toggle(listing: tk.Listbox):
+    """Paint one selection state across rows while the left button is dragged."""
+
+    drag = {"last": None, "select": True}
+
+    def set_range(first: int, last: int) -> None:
+        start, end = sorted((first, last))
+        if drag["select"]:
+            listing.selection_set(start, end)
+        else:
+            listing.selection_clear(start, end)
+
+    def start(event):
+        index = listing.nearest(event.y)
+        drag.update(last=index, select=not listing.selection_includes(index))
+        set_range(index, index)
+        return "break"
+
+    def move(event):
+        index = listing.nearest(event.y)
+        if index != drag["last"]:
+            set_range(drag["last"], index)
+            drag["last"] = index
+        return "break"
+
+    listing.bind("<Button-1>", start)
+    listing.bind("<B1-Motion>", move)
+    return start, move
+
+
 class BrainSectionGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -1152,11 +1182,15 @@ class BrainSectionGui:
         window.geometry("650x620")
         window.transient(self.root)
         window.grab_set()
-        ttk.Label(window, text="Select the images to include. Image-category switches still apply.").pack(pady=8)
+        ttk.Label(
+            window,
+            text="Click or drag to select. Start on a selected item and drag to clear. Image-category switches still apply.",
+        ).pack(pady=8)
         frame = ttk.Frame(window)
         frame.pack(fill="both", expand=True, padx=12)
         listing = tk.Listbox(frame, selectmode="multiple", exportselection=False)
         listing.pack(side="left", fill="both", expand=True)
+        _bind_drag_toggle(listing)
         scroll = ttk.Scrollbar(frame, command=listing.yview)
         scroll.pack(side="right", fill="y")
         listing.configure(yscrollcommand=scroll.set)

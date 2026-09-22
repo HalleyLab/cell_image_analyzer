@@ -7,10 +7,41 @@ from tkinter import ttk
 
 from tkinterdnd2 import TkinterDnD
 
-from brain_section_analyzer.gui import BrainSectionGui
+from brain_section_analyzer.gui import BrainSectionGui, _bind_drag_toggle
 
 
 class SessionButtonTests(unittest.TestCase):
+    def test_selection_list_drag_paints_select_and_clear(self):
+        class Listing:
+            def __init__(self):
+                self.selected = set()
+                self.bindings = {}
+
+            def bind(self, event, callback):
+                self.bindings[event] = callback
+
+            def nearest(self, y):
+                return int(y)
+
+            def selection_includes(self, index):
+                return index in self.selected
+
+            def selection_set(self, first, last):
+                self.selected.update(range(first, last + 1))
+
+            def selection_clear(self, first, last):
+                self.selected.difference_update(range(first, last + 1))
+
+        listing = Listing()
+        start, move = _bind_drag_toggle(listing)
+        start(SimpleNamespace(y=0))
+        move(SimpleNamespace(y=2))
+        self.assertEqual(listing.selected, {0, 1, 2})
+
+        start(SimpleNamespace(y=1))
+        move(SimpleNamespace(y=3))
+        self.assertEqual(listing.selected, {0})
+
     def test_compact_sections_expand_without_losing_controls(self):
         root = TkinterDnD.Tk()
         root.withdraw()
