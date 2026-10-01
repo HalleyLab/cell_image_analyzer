@@ -124,6 +124,8 @@ def _preview_image_choices(files: dict[str, Any]) -> dict[str, Path]:
         if path.is_file() and path.suffix.casefold() in {".png", ".tif", ".tiff"}:
             label = "Overview QC" if key == "qc" else key.removeprefix("processing_").replace("_", " ").title()
             choices[label] = path
+    if "Overview QC" in choices:
+        choices = {"Overview QC": choices.pop("Overview QC"), **choices}
     return choices
 
 
@@ -1113,7 +1115,7 @@ class BrainSectionGui:
             state="disabled",
         )
         self.open_preview_button.pack(side="left")
-        ttk.Label(preview_frame, text="A: previous preview | D: next preview").grid(
+        ttk.Label(preview_frame, text="A / Left: previous preview | D / Right: next preview").grid(
             row=3, column=0, sticky="w", pady=(6, 0)
         )
         display_settings = ttk.Frame(preview_frame)
@@ -1987,7 +1989,7 @@ class BrainSectionGui:
         preview_path = Path(path)
         with Image.open(preview_path) as image:
             preview = image.convert("RGB")
-            preview.thumbnail((680, 500), Image.Resampling.LANCZOS)
+            preview.thumbnail((820, 620), Image.Resampling.LANCZOS)
         self.preview_photo = ImageTk.PhotoImage(preview)
         self.preview_path = preview_path
         self.preview_label.configure(image=self.preview_photo, text="")
@@ -2001,7 +2003,7 @@ class BrainSectionGui:
             values=choices, state="readonly" if choices else "disabled"
         )
         if choices:
-            self.preview_choice.set(self.preview_choice.get() if self.preview_choice.get() in choices else choices[0])
+            self.preview_choice.set(choices[0])
             self._show_selected_preview()
         else:
             self.preview_choice.set("")
@@ -2015,7 +2017,7 @@ class BrainSectionGui:
 
     def _preview_key(self, event: Any) -> str | None:
         key = event.keysym.lower()
-        if key not in {"a", "d"} or event.state & (0x4 | 0x8 | 0x20000):
+        if key not in {"a", "d", "left", "right"} or event.state & (0x4 | 0x8 | 0x20000):
             return None
         if self.notebook.select() != str(self.output_tab):
             return None
@@ -2028,7 +2030,7 @@ class BrainSectionGui:
             return None
         current = self.preview_choice.get()
         index = choices.index(current) if current in choices else 0
-        self.preview_choice.set(choices[(index + (1 if key == "d" else -1)) % len(choices)])
+        self.preview_choice.set(choices[(index + (1 if key in {"d", "right"} else -1)) % len(choices)])
         self._show_selected_preview()
         return "break"
 

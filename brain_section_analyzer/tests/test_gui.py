@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from tkinter import ttk
 
 from tkinterdnd2 import TkinterDnD
@@ -109,6 +109,12 @@ class SessionButtonTests(unittest.TestCase):
             event.widget = gui.preview_selector
             gui._preview_key(event)
             self.assertEqual(gui.preview_choice.get(), "First")
+            event.keysym = "Right"
+            gui._preview_key(event)
+            self.assertEqual(gui.preview_choice.get(), "Second")
+            event.keysym = "Left"
+            gui._preview_key(event)
+            self.assertEqual(gui.preview_choice.get(), "First")
             entry = ttk.Entry(root)
             event.widget = entry
             self.assertIsNone(gui._preview_key(event))
@@ -122,7 +128,24 @@ class SessionButtonTests(unittest.TestCase):
             gui.notebook.select(gui.output_tab)
             gui.preview_files = {}
             self.assertIsNone(gui._preview_key(event))
-            self.assertEqual(gui._show_selected_preview.call_count, 4)
+            self.assertEqual(gui._show_selected_preview.call_count, 6)
+        finally:
+            root.destroy()
+
+    def test_new_preview_defaults_to_overview(self):
+        root = TkinterDnD.Tk()
+        root.withdraw()
+        try:
+            gui = BrainSectionGui(root)
+            gui.preview_choice.set("Composite")
+            gui._show_selected_preview = Mock()
+            with patch(
+                "brain_section_analyzer.gui._preview_image_choices",
+                return_value={"Overview QC": None, "Composite": None},
+            ):
+                gui._set_preview_files({})
+            self.assertEqual(gui.preview_choice.get(), "Overview QC")
+            gui._show_selected_preview.assert_called_once()
         finally:
             root.destroy()
 
