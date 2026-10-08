@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
-from .config import create_default_config, normalize_config, save_yaml, slugify
+from .config import create_default_config, normalize_config, save_yaml
 from .image_io import SUPPORTED_IMAGE_SUFFIXES, inspect_image
 from .pipeline import run_analysis
 
@@ -68,6 +68,9 @@ def prepare_batch_config(
 
     source = Path(image_path).expanduser().resolve()
     template_input = template_config.get("input", {})
+    confirmed_order = template_input.get("confirm_channel_order", False)
+    if not isinstance(confirmed_order, bool):
+        raise ValueError("input.confirm_channel_order must be a boolean (true/false).")
     info = inspect_image(
         source,
         pixel_size_um_x=template_input.get("pixel_size_um_x"),
@@ -87,11 +90,47 @@ def prepare_batch_config(
     ):
         if key in template_input:
             config["input"][key] = copy.deepcopy(template_input[key])
+    template_channels = template_config.get("channels", {})
     available_channels = {channel.index for channel in info.channels}
-    requested_channel = int(template_input.get("segmentation_channel", 0))
-    config["input"]["segmentation_channel"] = (
-        requested_channel if requested_channel in available_channels else info.channels[0].index
+    template_path = template_input.get("image_path") or template_input.get("czi_path")
+    same_file = bool(template_path) and (
+        str(Path(template_path).resolve()).casefold() == str(source).casefold()
     )
+    positional = {int(key): int(key) for key in template_channels if int(key) in available_channels}
+    mapping: dict[int, int] = {}
+    if len(template_channels) != len(info.channels):
+        raise ValueError("Channel count differs from the template. Configure this file separately.")
+    if same_file or len(info.channels) == 1:
+        mapping = (
+            {int(next(iter(template_channels))): info.channels[0].index}
+            if len(info.channels) == 1 else positional
+        )
+    else:
+        target_names: dict[str, list[int]] = {}
+        for channel in info.channels:
+            target_names.setdefault(str(channel.name).strip().casefold(), []).append(channel.index)
+        for key, item in template_channels.items():
+            name = str(item.get("source_name") or item.get("alias") or "").strip().casefold()
+            generic = re.fullmatch(r"(?:channel|ch|c|intensity)[_\s-]*\d*", name)
+            matches = target_names.get(name, [])
+            if name and not generic and len(matches) == 1:
+                mapping[int(key)] = matches[0]
+        if len(mapping) != len(template_channels) or len(set(mapping.values())) != len(mapping):
+            if confirmed_order:
+                mapping = positional
+            else:
+                raise ValueError(
+                    "Channel identities are missing, ambiguous, or different from the template. "
+                    "Inspect the channel order, then enable 'Confirm same channel order' "
+                    "or configure this file separately."
+                )
+    if len(mapping) != len(template_channels):
+        raise ValueError("Template channel indices do not match this file. Configure it separately.")
+    requested_channel = int(template_input.get("segmentation_channel", 0))
+    if requested_channel not in mapping:
+        raise ValueError("The template segmentation channel is unavailable.")
+    config["input"]["segmentation_channel"] = mapping[requested_channel]
+    config["input"]["confirm_channel_order"] = confirmed_order
     config["input"]["image_path"] = str(source)
     if source.suffix.casefold() == ".czi":
         config["input"]["czi_path"] = str(source)
@@ -104,27 +143,17 @@ def prepare_batch_config(
     if "output" in template_config:
         config["output"].update(copy.deepcopy(template_config["output"]))
 
-    template_channels = template_config.get("channels", {})
+    source_keys = {target: str(original) for original, target in mapping.items()}
     for channel in info.channels:
         key = str(channel.index)
-        channel_name = slugify(channel.name or "")
-        source_channel = next(
-            (
-                item
-                for item in template_channels.values()
-                if isinstance(item, dict)
-                and channel_name
-                and slugify(str(item.get("alias") or "")) == channel_name
-            ),
-            template_channels.get(key),
-        )
+        source_channel = template_channels[source_keys[channel.index]]
         if not isinstance(source_channel, dict):
             continue
         target_channel = config["channels"][key]
         for parameter, value in source_channel.items():
             if parameter == "measurement_threshold" and isinstance(value, dict):
                 target_channel[parameter].update(copy.deepcopy(value))
-            else:
+            elif parameter != "source_name":
                 target_channel[parameter] = copy.deepcopy(value)
 
     return normalize_config(config, info)

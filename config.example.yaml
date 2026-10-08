@@ -7,6 +7,7 @@ input:
   z_index: 0
   zoom: 1.0
   segmentation_channel: 0
+  confirm_channel_order: false
 segmentation:
   threshold_method: otsu
   threshold_scale: 0.8
@@ -33,6 +34,7 @@ segmentation:
 channels:
   '0':
     alias: DAPI
+    source_name: null  # Filled from image metadata, independent of the output alias.
     gaussian_sigma_px: 1.0
     measurement_threshold:
       method: otsu

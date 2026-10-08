@@ -15,6 +15,7 @@ from .models import CziInfo
 
 DEFAULT_CHANNEL_CONFIG: dict[str, Any] = {
     "alias": None,
+    "source_name": None,
     "gaussian_sigma_px": 1.0,
     "measurement_threshold": {
         "method": "otsu",
@@ -138,6 +139,7 @@ def create_default_config(
         used_aliases.add(slugify(candidate))
         channel_config = copy.deepcopy(DEFAULT_CHANNEL_CONFIG)
         channel_config["alias"] = candidate
+        channel_config["source_name"] = channel.name
         channels[str(channel.index)] = channel_config
 
     input_config: dict[str, Any] = {
@@ -149,6 +151,7 @@ def create_default_config(
         "z_index": 0,
         "zoom": float(zoom),
         "segmentation_channel": info.channels[0].index if info.channels else 0,
+        "confirm_channel_order": False,
         "pixel_size_um_x": info.pixel_size_um_x,
         "pixel_size_um_y": info.pixel_size_um_y,
     }
@@ -202,6 +205,8 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
     input_config["time_index"] = int(input_config.get("time_index", 0))
     input_config["z_index"] = int(input_config.get("z_index", 0))
     input_config["segmentation_channel"] = int(input_config["segmentation_channel"])
+    if not isinstance(input_config["confirm_channel_order"], bool):
+        raise ValueError("input.confirm_channel_order must be a boolean (true/false).")
     if input_config["z_projection"] not in {"single", "max", "mean"}:
         raise ValueError("input.z_projection must be 'single', 'max', or 'mean'.")
 
@@ -229,6 +234,7 @@ def normalize_config(config: dict[str, Any], info: CziInfo) -> dict[str, Any]:
             }
         item = _deep_merge(DEFAULT_CHANNEL_CONFIG, allowed)
         item["alias"] = item.get("alias") or channel.name or f"Channel_{channel.index}"
+        item["source_name"] = channel.name
         item["gaussian_sigma_px"] = max(0.0, float(item["gaussian_sigma_px"]))
         measurement_method = str(item["measurement_threshold"].get("method", "otsu"))
         if measurement_method not in {

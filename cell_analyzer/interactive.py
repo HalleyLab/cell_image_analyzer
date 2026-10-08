@@ -52,13 +52,13 @@ def _preview_segmentation_config(config: dict[str, Any], scale: float) -> dict[s
         "local_contrast_ring_px",
         "min_peak_distance_px",
         "adaptive_block_size_px",
-        "watershed_min_peak_height_px",
-        "watershed_min_peak_prominence_px",
         "border_exclusion_margin_px",
     )
     for key in linear_keys:
         minimum = 1 if key in {"local_contrast_ring_px", "min_peak_distance_px"} else 0
         result[key] = max(minimum, round(float(result.get(key, 0)) * scale))
+    for key in ("watershed_min_peak_height_px", "watershed_min_peak_prominence_px"):
+        result[key] = max(0.0, float(result.get(key, 0.0)) * scale)
     result["min_hole_area_px"] = max(
         0, round(float(result.get("min_hole_area_px", 0)) * scale**2)
     )
@@ -303,18 +303,23 @@ class LiveTuningPanel:
                 self.opening,
                 self.closing,
                 self.fill_holes,
-                self.hole_area,
                 self.circularity,
-                self.contrast,
                 self.split,
                 self.peak,
-                self.peak_height,
                 self.peak_prominence,
-                self.compactness,
                 self.clear_border,
                 self.border_margin,
             ]
         )
+        self.advanced_controls = widgets.Accordion(
+            children=(widgets.VBox((
+                self.contrast, self.hole_area, self.peak_height, self.compactness,
+            )),),
+            selected_index=None,
+        )
+        self.advanced_controls.set_title(0, "Advanced filters (optional)")
+        self.advanced_summary = widgets.HTML()
+        segmentation_box.children += (self.advanced_summary, self.advanced_controls)
         self.accordion = widgets.Accordion(children=(channel_box, segmentation_box))
         channel_title = (
             "Image smoothing and signal area"
@@ -434,9 +439,36 @@ class LiveTuningPanel:
 
     def _update_signal_control_state(self) -> None:
         method = str(self.signal_method.value)
-        self.signal_value.disabled = method != "manual"
-        self.signal_scale.disabled = method in {"none", "manual"}
-        self.signal_percentile.disabled = method != "percentile"
+        cell_method = str(self.cell_method.value)
+        active = (
+            (self.signal_value, method == "manual"),
+            (self.signal_scale, method not in {"none", "manual"}),
+            (self.signal_percentile, method == "percentile"),
+            (self.threshold_scale, cell_method != "adaptive"),
+            (self.cell_percentile, cell_method == "percentile"),
+            (self.adaptive_block, cell_method == "adaptive"),
+            (self.adaptive_offset, cell_method == "adaptive"),
+            (self.hole_area, not self.fill_holes.value),
+            (self.peak, self.split.value),
+            (self.peak_prominence, self.split.value),
+            (self.peak_height, self.split.value),
+            (self.compactness, self.split.value),
+            (self.border_margin, self.clear_border.value),
+        )
+        for control, enabled in active:
+            control.disabled = not enabled
+            control.layout.display = "" if enabled else "none"
+        filters = []
+        if self.contrast.value > 0:
+            filters.append(f"local contrast ≥ {self.contrast.value:g}")
+        if not self.fill_holes.value and self.hole_area.value > 0:
+            filters.append(f"fill holes smaller than {self.hole_area.value} px²")
+        if self.split.value:
+            if self.peak_height.value > 0:
+                filters.append(f"peak height > {self.peak_height.value:g} px")
+            if self.compactness.value > 0:
+                filters.append(f"compactness {self.compactness.value:g}")
+        self.advanced_summary.value = "<b>Active advanced filters:</b> " + ("; ".join(filters) or "none")
 
     def _store(self) -> None:
         channel_index = int(self.parameter_channel.value)
@@ -544,6 +576,8 @@ class LiveTuningPanel:
                 f"{diagnostics.get('connected_component_count')} cleaned objects | cell threshold "
                 f"{diagnostics.get('threshold')} | signal threshold {signal_threshold} | "
                 f"rejected by area {diagnostics.get('rejected_area')} | "
+                f"rejected by circularity {diagnostics.get('rejected_shape')} | "
+                f"rejected by local contrast {diagnostics.get('rejected_contrast')} | "
                 f"rejected by border {diagnostics.get('rejected_border')} | "
                 f"{zoom_note}. Controls update <code>config</code> automatically."
             )
@@ -746,6 +780,13 @@ class BatchTuningPanel:
             button_style="success",
             icon="play",
         )
+        self.confirm_channel_order = widgets.Checkbox(
+            description="Confirm same channel order (ambiguous metadata)",
+            value=bool(self.config.get("input", {}).get("confirm_channel_order", False)),
+            indent=False,
+            tooltip="Enable only after verifying every file uses the same channel order. Named channels are matched automatically.",
+        )
+        self.confirm_channel_order.observe(self._confirm_channel_order, names="value")
         self.batch_status = widgets.HTML(value="<b>Select one or more microscopy images.</b>")
         self.result_table = widgets.HTML()
         self.preview_container = widgets.VBox()
@@ -775,6 +816,7 @@ class BatchTuningPanel:
                 file_buttons,
                 navigation,
                 self.output_root_widget,
+                self.confirm_channel_order,
                 self.run_button,
                 self.batch_status,
                 self.result_table,
@@ -804,6 +846,16 @@ class BatchTuningPanel:
         if not paths:
             raise ValueError("Select at least one supported microscopy image.")
         return paths
+
+    def _confirm_channel_order(self, change: dict[str, Any]) -> None:
+        value = bool(change["new"])
+        self.config["input"]["confirm_channel_order"] = value
+        for config in self.file_configs.values():
+            config["input"]["confirm_channel_order"] = value
+        if self.current_panel is not None:
+            self.current_panel.config["input"]["confirm_channel_order"] = value
+        if self.file_selector.value and self.current_panel is None:
+            self._load_selected_panel()
 
     def _set_paths(self, values: list[str | Path]) -> None:
         try:
@@ -997,6 +1049,7 @@ class BatchTuningPanel:
             self.previous_button,
             self.next_button,
             self.output_root_widget,
+            self.confirm_channel_order,
             self.run_button,
         ):
             control.disabled = busy

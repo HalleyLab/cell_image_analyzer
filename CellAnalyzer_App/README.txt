@@ -21,6 +21,19 @@ For a workflow that never starts Python, choose Plugins > Macros > Install and o
 Run "Cell Analyzer Native Self-Test" first, then run "Cell Analyzer Native" on the active 2D multichannel image.
 See ImageJ_Macro\CellAnalyzer_Native_Fiji_README.txt for the workflow, outputs, and scope.
 
+Fiji/ImageJ native cell-ROI workflow
+
+For one segmentation channel defining cell ROIs and all channels measured inside
+the same ROIs, install ImageJ_Macro\CellAnalyzer_ROI_Fiji.ijm instead.
+Run "Cell Analyzer ROI - Self-Test", then "Cell Analyzer ROI - Preview or Batch".
+The preview can show the segmentation overview or each channel's positive mask
+and positive signal inside cell boundaries. Batch mode requires confirmation
+that all files have the same channel order. This macro does not start Python.
+See ImageJ_Macro\CellAnalyzer_ROI_Fiji_README.md for usage and the project-root
+README.md for parameter formulas, packages, functions, and Python/Fiji differences.
+The corresponding Notebook workflow is cell_analyzer_batch.ipynb / cell_analyzer.ipynb.
+These ROI changes do not replace the EXE's separate advanced-analysis workflow.
+
 
 Advanced analyses and drawing controls
 

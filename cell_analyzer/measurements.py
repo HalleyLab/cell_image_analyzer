@@ -97,6 +97,7 @@ def measure_rois(
         thresholded_raw = np.where(positive_mask, processed.raw, 0)
 
         if roi_count:
+            unfiltered_means = ndi.mean(processed.raw, labels=labels, index=label_ids)
             raw_means = ndi.mean(thresholded_raw, labels=labels, index=label_ids)
             integrated_intensities = ndi.sum(
                 thresholded_raw, labels=labels, index=label_ids
@@ -108,12 +109,18 @@ def measure_rois(
                 1 : roi_count + 1
             ].astype(float)
         else:
+            unfiltered_means = np.array([], dtype=float)
             raw_means = np.array([], dtype=float)
             integrated_intensities = np.array([], dtype=float)
             positive_counts = np.array([], dtype=float)
             roi_counts = np.array([], dtype=float)
 
         table[f"{column_id}_mean_intensity"] = raw_means
+        table[f"{column_id}_raw_mean_intensity"] = unfiltered_means
+        table[f"{column_id}_positive_mean_intensity"] = np.divide(
+            integrated_intensities, positive_counts,
+            out=np.full_like(positive_counts, np.nan), where=positive_counts > 0,
+        )
         table[f"{column_id}_integrated_intensity"] = integrated_intensities
         table[f"{column_id}_positive_area_um2"] = (
             positive_counts * pixel_area_um2 if pixel_area_um2 else np.nan

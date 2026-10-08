@@ -14,7 +14,7 @@ import tifffile
 from PIL import Image
 from pylibCZIrw import czi as pyczi
 
-from cell_analyzer.batch import run_batch_analysis
+from cell_analyzer.batch import prepare_batch_config, run_batch_analysis
 from cell_analyzer.config import (
     create_default_config,
     load_yaml,
@@ -23,12 +23,14 @@ from cell_analyzer.config import (
 )
 from cell_analyzer.czi_io import inspect_czi, read_czi_channels
 from cell_analyzer.image_io import inspect_image, read_image_channels
-from cell_analyzer.interactive import launch_batch_tuning_widget
+from cell_analyzer.interactive import (
+    LiveTuningPanel, _preview_segmentation_config, launch_batch_tuning_widget,
+)
 from cell_analyzer.measurements import measure_rois
 from cell_analyzer.models import ChannelInfo, CziInfo, ProcessedChannel, SceneInfo
 from cell_analyzer.pipeline import run_analysis
 from cell_analyzer.preprocessing import preprocess_channel_steps
-from cell_analyzer.segmentation import segment_cells, threshold_image
+from cell_analyzer.segmentation import _watershed_labels, segment_cells, threshold_image
 
 
 def _disk(shape: tuple[int, int], center: tuple[int, int], radius: int) -> np.ndarray:
@@ -81,6 +83,97 @@ def create_single_channel_png(path: Path, seed: int = 7) -> None:
 
 
 class SyntheticPipelineTest(unittest.TestCase):
+    def test_preview_preserves_float_watershed_parameters(self) -> None:
+        config = {
+            "split_touching": True, "min_peak_distance_px": 2,
+            "watershed_min_peak_height_px": 0.3,
+            "watershed_min_peak_prominence_px": 0.4,
+            "watershed_compactness": 0.25,
+        }
+        preview = _preview_segmentation_config(config, 1.0)
+        self.assertEqual(preview["watershed_min_peak_height_px"], 0.3)
+        self.assertEqual(preview["watershed_min_peak_prominence_px"], 0.4)
+        small = _preview_segmentation_config(config, 0.25)
+        self.assertAlmostEqual(small["watershed_min_peak_prominence_px"], 0.1)
+        self.assertEqual(small["watershed_compactness"], 0.25)
+        y, x = np.mgrid[:64, :64]
+        mask = ((y - 32)**2 + (x - 24)**2 < 144) | ((y - 32)**2 + (x - 40)**2 < 144)
+        np.testing.assert_array_equal(_watershed_labels(mask, preview), _watershed_labels(mask, config))
+
+    def test_batch_remaps_roles_and_settings_by_source_channel_name(self) -> None:
+        metadata = dict(
+            dimensions={"C": (0, 2), "X": (0, 8), "Y": (0, 8)},
+            scenes=[SceneInfo(index=0, x=0, y=0, width=8, height=8)],
+            pixel_size_um_x=1.0, pixel_size_um_y=1.0,
+        )
+        original = CziInfo(path="original.czi", channels=[ChannelInfo(0, "Cells"), ChannelInfo(1, "Signal")], **metadata)
+        reordered = CziInfo(path="reordered.czi", channels=[ChannelInfo(0, "Signal"), ChannelInfo(1, "Cells")], **metadata)
+        config = create_default_config(original)
+        config["channels"]["0"]["alias"] = "Custom cell name"
+        config["channels"]["0"]["gaussian_sigma_px"] = 2.5
+        config["channels"]["1"]["measurement_threshold"].update(method="manual", value=1234)
+        with patch("cell_analyzer.batch.inspect_image", return_value=reordered):
+            result = prepare_batch_config(reordered.path, config, "unused_output")
+        self.assertEqual(result["input"]["segmentation_channel"], 1)
+        self.assertEqual(result["channels"]["1"]["alias"], "Custom cell name")
+        self.assertEqual(result["channels"]["1"]["gaussian_sigma_px"], 2.5)
+        self.assertEqual(result["channels"]["0"]["measurement_threshold"]["value"], 1234)
+        self.assertEqual(result["channels"]["0"]["source_name"], "Signal")
+        ambiguous = CziInfo(path="ambiguous.czi", channels=[ChannelInfo(0, "Channel_0"), ChannelInfo(1, "Channel_1")], **metadata)
+        with patch("cell_analyzer.batch.inspect_image", return_value=ambiguous):
+            with self.assertRaisesRegex(ValueError, "Confirm same channel order"):
+                prepare_batch_config(ambiguous.path, config, "unused_output")
+            config["input"]["confirm_channel_order"] = True
+            result = prepare_batch_config(ambiguous.path, config, "unused_output")
+        self.assertEqual(result["input"]["segmentation_channel"], 0)
+        duplicate = CziInfo(path="duplicate.czi", channels=[ChannelInfo(0, "Cells"), ChannelInfo(1, "Cells")], **metadata)
+        config["input"]["confirm_channel_order"] = False
+        with patch("cell_analyzer.batch.inspect_image", return_value=duplicate):
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                prepare_batch_config(duplicate.path, config, "unused_output")
+        config["input"]["confirm_channel_order"] = "false"
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            prepare_batch_config(ambiguous.path, config, "unused_output")
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            normalize_config(config, original)
+
+    def test_parameter_visibility_preserves_saved_advanced_settings(self) -> None:
+        info = CziInfo(
+            path="controls.czi",
+            dimensions={"C": (0, 1), "X": (0, 8), "Y": (0, 8)},
+            channels=[ChannelInfo(index=0, name="Cells")],
+            scenes=[SceneInfo(index=0, x=0, y=0, width=8, height=8)],
+            pixel_size_um_x=1.0,
+            pixel_size_um_y=1.0,
+        )
+        config = create_default_config(info)
+        config["segmentation"].update(
+            watershed_min_peak_height_px=7.0, watershed_compactness=0.4
+        )
+        with patch("cell_analyzer.interactive.inspect_image", return_value=info):
+            panel = LiveTuningPanel(config)
+        self.assertIsNone(panel.advanced_controls.selected_index)
+        self.assertEqual(panel.peak.layout.display, "none")
+        self.assertEqual(panel.adaptive_block.layout.display, "none")
+        self.assertEqual(panel.hole_area.layout.display, "none")
+        panel.signal_method.value = "manual"
+        self.assertEqual(panel.signal_value.layout.display, "")
+        self.assertEqual(panel.signal_scale.layout.display, "none")
+        panel.cell_method.value = "adaptive"
+        self.assertEqual(panel.adaptive_block.layout.display, "")
+        self.assertEqual(panel.threshold_scale.layout.display, "none")
+        panel.split.value = True
+        self.assertEqual(panel.peak.layout.display, "")
+        self.assertIn("peak height > 7", panel.advanced_summary.value)
+        self.assertIn("compactness 0.4", panel.advanced_summary.value)
+        panel.images = {0: np.ones((8, 8), dtype=np.float32)}
+        with patch.object(panel, "_draw"):
+            panel.refresh()
+        self.assertIn("rejected by circularity", panel.status.value)
+        self.assertIn("rejected by local contrast", panel.status.value)
+        self.assertEqual(config["segmentation"]["watershed_min_peak_height_px"], 7.0)
+        self.assertEqual(config["segmentation"]["watershed_compactness"], 0.4)
+
     def test_default_config_has_no_intensity_transformation_settings(self) -> None:
         info = CziInfo(
             path="default_background.czi",
@@ -95,7 +188,7 @@ class SyntheticPipelineTest(unittest.TestCase):
         for channel in config["channels"].values():
             self.assertEqual(
                 set(channel),
-                {"alias", "gaussian_sigma_px", "measurement_threshold"},
+                {"alias", "source_name", "gaussian_sigma_px", "measurement_threshold"},
             )
             self.assertNotIn("background_radius_px", channel)
             self.assertNotIn("normalize_low_percentile", channel)
@@ -125,6 +218,7 @@ class SyntheticPipelineTest(unittest.TestCase):
             config = create_default_config(
                 inspect_czi(first_path), output_dir=temporary / "batch_results"
             )
+            config["input"]["confirm_channel_order"] = True
             panel = launch_batch_tuning_widget(
                 config,
                 czi_paths=[first_path, second_path],
@@ -205,6 +299,7 @@ class SyntheticPipelineTest(unittest.TestCase):
             config = create_default_config(
                 inspect_czi(first_path), output_dir=temporary / "batch_results"
             )
+            config["input"]["confirm_channel_order"] = True
             panel = launch_batch_tuning_widget(
                 config,
                 czi_paths=[first_path],
@@ -235,6 +330,7 @@ class SyntheticPipelineTest(unittest.TestCase):
 
             info = inspect_czi(first_path)
             config = create_default_config(info, output_dir=temporary / "unused")
+            config["input"]["confirm_channel_order"] = True
             config["segmentation"].update(
                 {
                     "min_area_um2": 100,
@@ -598,6 +694,8 @@ class SyntheticPipelineTest(unittest.TestCase):
         )
         self.assertAlmostEqual(thresholds["signal"], 6.0)
         self.assertAlmostEqual(table.loc[0, "signal_mean_intensity"], 7.5)
+        self.assertAlmostEqual(table.loc[0, "signal_raw_mean_intensity"], 8.25)
+        self.assertAlmostEqual(table.loc[0, "signal_positive_mean_intensity"], 15.0)
         self.assertAlmostEqual(table.loc[0, "signal_integrated_intensity"], 30.0)
         self.assertAlmostEqual(table.loc[0, "signal_positive_area_um2"], 2.0)
         self.assertAlmostEqual(table.loc[0, "signal_positive_fraction"], 0.5)
@@ -608,6 +706,8 @@ class SyntheticPipelineTest(unittest.TestCase):
         )
         self.assertAlmostEqual(thresholds["signal"], 12.0)
         self.assertAlmostEqual(stricter.loc[0, "signal_mean_intensity"], 5.0)
+        self.assertAlmostEqual(stricter.loc[0, "signal_positive_mean_intensity"], 20.0)
+        self.assertAlmostEqual(stricter.loc[0, "signal_raw_mean_intensity"], 8.25)
         self.assertAlmostEqual(stricter.loc[0, "signal_integrated_intensity"], 20.0)
 
         threshold_config = channel_configs["0"]["measurement_threshold"]
@@ -629,6 +729,8 @@ class SyntheticPipelineTest(unittest.TestCase):
         self.assertEqual(all_zero.loc[0, "signal_integrated_intensity"], 0.0)
         self.assertEqual(all_zero.loc[0, "signal_positive_area_um2"], 0.0)
         self.assertEqual(all_zero.loc[0, "signal_positive_fraction"], 0.0)
+        self.assertTrue(np.isnan(all_zero.loc[0, "signal_positive_mean_intensity"]))
+        self.assertAlmostEqual(all_zero.loc[0, "signal_raw_mean_intensity"], 8.25)
 
     def test_square_micrometer_area_limits_convert_at_each_zoom(self) -> None:
         info = CziInfo(

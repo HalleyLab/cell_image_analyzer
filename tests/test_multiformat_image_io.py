@@ -8,12 +8,15 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
+_REQUESTED_CACHE = os.environ.get("CELL_ANALYZER_CACHE_DIR")
+
 from cell_analyzer.image_io import inspect_image, read_image_channels
 
 
 class MultiFormatImageIoTest(unittest.TestCase):
-    def test_runtime_cache_and_temp_stay_with_project(self) -> None:
-        expected = Path(__file__).resolve().parent.parent / "local_artifacts" / "cache" / "application"
+    def test_runtime_cache_and_temp_respect_configured_folder(self) -> None:
+        default = Path(__file__).resolve().parent.parent / "local_artifacts" / "cache" / "application"
+        expected = Path(_REQUESTED_CACHE).resolve() if _REQUESTED_CACHE else default
         self.assertEqual(Path(tempfile.gettempdir()), expected / "tmp")
         for name in ("CELL_ANALYZER_CACHE_DIR", "CJDK_CACHE_DIR", "MPLCONFIGDIR"):
             configured = Path(os.environ[name]).resolve()
